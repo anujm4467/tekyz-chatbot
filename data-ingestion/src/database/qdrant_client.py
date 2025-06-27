@@ -426,6 +426,126 @@ class QdrantManager:
         
         return health_status
     
+    def get_existing_content_hashes(self) -> set:
+        """
+        Get all existing content hashes from the collection in one batch operation.
+        
+        Returns:
+            Set of existing content hashes
+        """
+        if not self._connected:
+            logger.warning("Not connected to Qdrant, returning empty hash set")
+            return set()
+        
+        try:
+            existing_hashes = set()
+            offset = None
+            
+            # Scroll through all points to get content hashes
+            while True:
+                scroll_result = self.client.scroll(
+                    collection_name=self.config.collection_name,
+                    offset=offset,
+                    limit=100,  # Batch size
+                    with_payload=["content_hash"],  # Only fetch content_hash field
+                    with_vectors=False  # Don't fetch vectors for efficiency
+                )
+                
+                points, next_offset = scroll_result
+                
+                if not points:
+                    break
+                
+                # Extract content hashes
+                for point in points:
+                    if point.payload and 'content_hash' in point.payload:
+                        existing_hashes.add(point.payload['content_hash'])
+                
+                # Continue scrolling if there are more points
+                if next_offset is None:
+                    break
+                offset = next_offset
+            
+            logger.info(f"Retrieved {len(existing_hashes)} existing content hashes from collection")
+            return existing_hashes
+            
+        except Exception as e:
+            logger.warning(f"Error getting existing content hashes: {e}")
+            return set()
+
+    def check_content_exists(self, content_hash: str) -> bool:
+        """
+        Check if content with given hash already exists in the collection.
+        
+        Args:
+            content_hash: MD5 hash of the content text
+            
+        Returns:
+            True if content exists, False otherwise
+        """
+        if not self._connected:
+            logger.warning("Not connected to Qdrant, assuming content doesn't exist")
+            return False
+        
+        try:
+            # Use a more efficient search instead of scroll
+            search_results = self.client.search(
+                collection_name=self.config.collection_name,
+                query_vector=[0.0] * 384,  # Dummy query vector since we're filtering by hash
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="content_hash",
+                            match=models.MatchValue(value=content_hash)
+                        )
+                    ]
+                ),
+                limit=1,
+                with_payload=False,
+                with_vectors=False
+            )
+            
+            # If we found any results, content exists
+            return len(search_results) > 0
+            
+        except Exception as e:
+            logger.warning(f"Error checking content existence: {e}")
+            return False
+    
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """
+        Get detailed statistics about the collection.
+        
+        Returns:
+            Dictionary with collection statistics
+        """
+        if not self._connected:
+            return {"error": "Not connected to Qdrant"}
+        
+        try:
+            collection_info = self.client.get_collection(self.config.collection_name)
+            
+            # Get count of points
+            count_result = self.client.count(
+                collection_name=self.config.collection_name,
+                exact=True
+            )
+            
+            return {
+                "points_count": count_result.count,
+                "config": {
+                    "vector_size": collection_info.config.params.vectors.size,
+                    "distance": collection_info.config.params.vectors.distance.value
+                },
+                "status": collection_info.status.value,
+                "optimizer_status": collection_info.optimizer_status,
+                "indexed_vectors_count": collection_info.indexed_vectors_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get collection stats: {e}")
+            return {"error": str(e)}
+    
     def __del__(self):
         """Cleanup on destruction."""
         if self._connected:

@@ -176,16 +176,25 @@ class TekyzScraper:
             return False
         
         # Check if it's actually tekyz.com content
-        if 'tekyz' not in response.text.lower():
+        response_text_lower = response.text.lower()
+        if 'tekyz' not in response_text_lower:
             logger.warning("Page doesn't appear to be Tekyz content")
+            logger.debug(f"Response text preview: {response.text[:200]}...")
             return False
         
         # Check for error pages
-        soup = BeautifulSoup(response.content, 'lxml')
-        if soup.find('title') and '404' in soup.find('title').get_text():
-            logger.warning("404 error page detected")
-            return False
+        try:
+            soup = BeautifulSoup(response.content, 'lxml')
+            title_element = soup.find('title')
+            if title_element:
+                title_text = title_element.get_text().lower()
+                if '404' in title_text or 'not found' in title_text:
+                    logger.warning(f"404 error page detected, title: {title_text}")
+                    return False
+        except Exception as e:
+            logger.warning(f"Error checking for 404 page: {str(e)}")
         
+        logger.debug("Page validation passed")
         return True
     
     def close(self):

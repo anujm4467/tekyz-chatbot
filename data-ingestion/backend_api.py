@@ -14,12 +14,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import threading
 import time
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import uvicorn
+from fastapi.staticfiles import StaticFiles
 
 # Add the src directory to the Python path
 import sys
@@ -40,6 +43,8 @@ try:
 except ImportError:
     HAS_DOCX_SUPPORT = False
 
+from src.database.pipeline_tracker import PipelineTracker, PipelineMetrics, PipelineJob
+pipeline_tracker = PipelineTracker()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -70,15 +75,26 @@ class PipelineStatus(BaseModel):
     errors: List[Any] = []
     job_id: Optional[str] = None
 
+# Global state management (WebSocketManager initialized after class definition)
+active_jobs: Dict[str, PipelineJob] = {}
+pipeline_tracker = PipelineTracker()
+
 class PipelineJob:
     def __init__(self, job_id: str):
         self.job_id = job_id
         self.status = PipelineStatus(job_id=job_id)
         self.thread: Optional[threading.Thread] = None
         self.should_stop = threading.Event()
+        self.metrics = PipelineMetrics(start_time=time.time())
         
     def start(self, file_data: List[dict], urls: List[str], websocket_manager):
         """Start the pipeline in a separate thread"""
+        # Initialize tracking
+        input_urls = urls if urls else []
+        pipeline_tracker.start_job(self.job_id, input_urls)
+        pipeline_tracker.start_step(self.job_id, "initialization")
+        
+        # Start processing thread
         self.thread = threading.Thread(
             target=self._run_pipeline,
             args=(file_data, urls, websocket_manager),
@@ -89,40 +105,127 @@ class PipelineJob:
     def stop(self):
         """Stop the pipeline"""
         self.should_stop.set()
+        pipeline_tracker.add_log(self.job_id, "Pipeline stopped by user", 'WARNING')
+        
+    def _update_metrics(self, **kwargs):
+        """Update pipeline metrics"""
+        for key, value in kwargs.items():
+            if hasattr(self.metrics, key):
+                setattr(self.metrics, key, value)
+        
+        # Calculate ETA
+        if self.metrics.processing_rate > 0 and self.metrics.total_urls > 0:
+            remaining = self.metrics.total_urls - self.metrics.processed_urls
+            if remaining > 0:
+                self.metrics.estimated_completion = time.time() + (remaining / self.metrics.processing_rate)
+        
+        # Update tracker
+        pipeline_tracker.update_metrics(self.job_id, self.metrics)
         
     def _run_pipeline(self, file_data: List[dict], urls: List[str], websocket_manager):
-        """Execute the pipeline"""
+        """Execute the pipeline with enhanced tracking"""
         try:
             self.status.is_running = True
             self.status.current_step = "Initializing"
             self.status.progress = 0
-            websocket_manager.broadcast(self.status.dict())
+            
+            # Initialize metrics
+            self.metrics.total_urls = len(urls) if urls else 0
+            self._update_metrics()
+            
+            pipeline_tracker.add_log(self.job_id, "Pipeline execution started")
+            pipeline_tracker.complete_step(self.job_id, "initialization", success=True)
+            websocket_manager.broadcast(self._get_enhanced_status())
             
             # Save uploaded files
             if file_data:
+                pipeline_tracker.start_step(self.job_id, "file_processing", len(file_data))
                 self._save_file_data(file_data, websocket_manager)
-                self.status.logs.append(f"✅ Saved {len(file_data)} uploaded files")
-                websocket_manager.broadcast(self.status.dict())
+                pipeline_tracker.complete_step(self.job_id, "file_processing", success=True)
+                pipeline_tracker.add_log(self.job_id, f"Saved {len(file_data)} uploaded files")
+            else:
+                pipeline_tracker.skip_step(self.job_id, "file_processing", "No files to process")
                 
             # Process URLs
             if urls:
+                pipeline_tracker.start_step(self.job_id, "url_discovery", len(urls))
                 self._process_urls(urls, websocket_manager)
-                self.status.logs.append(f"✅ Processed {len(urls)} URLs")
-                websocket_manager.broadcast(self.status.dict())
+                pipeline_tracker.complete_step(self.job_id, "url_discovery", success=True)
+                pipeline_tracker.add_log(self.job_id, f"Processed {len(urls)} URLs for scraping")
+            else:
+                pipeline_tracker.skip_step(self.job_id, "url_discovery", "No URLs to process")
                 
-            # Run the standalone pipeline (no external dependencies)
-            self.status.logs.append("Starting standalone processing...")
-            websocket_manager.broadcast(self.status.dict())
+            # Run the standalone pipeline
+            pipeline_tracker.add_log(self.job_id, "Starting content processing...")
             self._execute_pipeline_direct(websocket_manager)
             
+            # Mark as completed
+            pipeline_tracker.start_step(self.job_id, "finalization")
+            pipeline_tracker.complete_step(self.job_id, "finalization", success=True)
+            pipeline_tracker.complete_job(self.job_id, success=True)
+            
         except Exception as e:
-            logger.error(f"Pipeline failed: {str(e)}")
+            error_msg = f"Pipeline failed: {str(e)}"
+            logger.error(error_msg)
             self.status.errors.append({"message": str(e), "timestamp": datetime.now().isoformat()})
-            websocket_manager.broadcast(self.status.dict())
+            
+            # Complete current step as failed
+            current_step = pipeline_tracker.get_current_step(self.job_id)
+            if current_step:
+                pipeline_tracker.complete_step(self.job_id, current_step.step_name, success=False, error_message=error_msg)
+            
+            pipeline_tracker.complete_job(self.job_id, success=False, error_message=error_msg)
+            websocket_manager.broadcast(self._get_enhanced_status())
         finally:
             self.status.is_running = False
             self.status.current_step = "Completed"
-            websocket_manager.broadcast(self.status.dict())
+            self.metrics.end_time = time.time()
+            self._update_metrics()
+            websocket_manager.broadcast(self._get_enhanced_status())
+    
+    def _get_enhanced_status(self) -> dict:
+        """Get enhanced status with ETA and metrics"""
+        status_dict = self.status.dict()
+        
+        # Add metrics and ETA
+        status_dict.update({
+            'metrics': {
+                'total_urls': self.metrics.total_urls,
+                'processed_urls': self.metrics.processed_urls,
+                'successful_urls': self.metrics.successful_urls,
+                'failed_urls': self.metrics.failed_urls,
+                'total_chunks': self.metrics.total_chunks,
+                'total_embeddings': self.metrics.total_embeddings,
+                'total_vectors': self.metrics.total_vectors,
+                'duplicate_count': self.metrics.duplicate_count,
+                'processing_rate': round(self.metrics.processing_rate, 2),
+                'elapsed_time': round(self.metrics.elapsed_time, 1),
+                'progress_percentage': round(self.metrics.progress_percentage, 1)
+            },
+            'eta': {
+                'eta_seconds': self.metrics.eta_seconds,
+                'eta_formatted': self._format_eta(self.metrics.eta_seconds) if self.metrics.eta_seconds else None,
+                'estimated_completion': self.metrics.estimated_completion
+            }
+        })
+        
+        return status_dict
+    
+    def _format_eta(self, eta_seconds: float) -> str:
+        """Format ETA in human-readable format"""
+        if eta_seconds <= 0:
+            return "Calculating..."
+        
+        if eta_seconds < 60:
+            return f"{int(eta_seconds)} seconds"
+        elif eta_seconds < 3600:
+            minutes = int(eta_seconds / 60)
+            seconds = int(eta_seconds % 60)
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = int(eta_seconds / 3600)
+            minutes = int((eta_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
     
     async def _save_uploaded_files(self, files: List[UploadFile], websocket_manager):
         """Save uploaded files to the data/raw directory"""
@@ -213,12 +316,26 @@ class PipelineJob:
         websocket_manager.broadcast(self.status.dict())
         
         # Save URLs to a file for the pipeline to process
+        # Make sure we don't overwrite existing URLs, append instead
         urls_file = Path("data/raw/urls.txt")
-        with open(urls_file, "w") as f:
-            for url in urls:
-                f.write(f"{url}\n")
-                
-        log_msg = f"Saved {len(urls)} URLs for processing"
+        
+        # Read existing URLs if file exists
+        existing_urls = set()
+        if urls_file.exists():
+            with open(urls_file, "r") as f:
+                existing_urls = {line.strip() for line in f if line.strip()}
+        
+        # Add new URLs that aren't already present
+        new_urls = [url for url in urls if url not in existing_urls]
+        
+        if new_urls:
+            with open(urls_file, "a") as f:  # Append mode
+                for url in new_urls:
+                    f.write(f"{url}\n")
+            log_msg = f"Added {len(new_urls)} new URLs for processing (total: {len(existing_urls) + len(new_urls)})"
+        else:
+            log_msg = f"All {len(urls)} URLs already exist in processing queue"
+            
         self.status.logs.append(log_msg)
         logger.info(log_msg)
         
@@ -229,7 +346,7 @@ class PipelineJob:
             websocket_manager.broadcast(self.status.dict())
             
             # Run the simplified pipeline without any complex dependencies
-            result = self._run_standalone_pipeline(websocket_manager)
+            result = asyncio.run(self._run_standalone_pipeline(websocket_manager))
             
             if result.get('success', False):
                 self.status.progress = 100
@@ -306,26 +423,145 @@ class PipelineJob:
             websocket_manager.broadcast(self.status.dict())
             raise
             
-    def _run_standalone_pipeline(self, websocket_manager):
+    async def _run_standalone_pipeline(self, websocket_manager):
         """Run a complete pipeline with text processing, embedding generation, and vector storage"""
         try:
-            # Check if we have uploaded files to process
+            processed_chunks = 0
+            generated_embeddings = 0
+            uploaded_vectors = 0
+            
+            # Check for URLs first
+            urls_file = Path("data/raw/urls.txt")
+            has_urls = urls_file.exists() and urls_file.stat().st_size > 0
+            
+            # Check for uploaded files
             upload_dir = Path("data/raw/uploads")
-            if upload_dir.exists() and list(upload_dir.glob("*")):
-                self.status.logs.append("Found uploaded files, processing...")
+            has_uploads = upload_dir.exists() and list(upload_dir.glob("*"))
+            
+            if has_urls:
+                # Read URLs from file first
+                with open(urls_file, 'r') as f:
+                    urls = [line.strip() for line in f if line.strip()]
+                
+                pipeline_tracker.start_step(self.job_id, "web_scraping", len(urls))
+                self.status.logs.append(f"Found {len(urls)} URLs to scrape")
+                pipeline_tracker.update_step_progress(self.job_id, "web_scraping", 0, 5)
+                websocket_manager.broadcast(self.status.dict())
+                
+                # Step 1: Web Scraping
+                self.status.current_step = "Web Scraping"
+                self.status.progress = 10
+                websocket_manager.broadcast(self.status.dict())
+                
+                scraped_data = await self._scrape_urls(urls, websocket_manager)
+                
+                # Improved success/failure logic for web scraping
+                if scraped_data and len(scraped_data) > 0:
+                    # Calculate success rate
+                    total_attempted = len(urls)  # This will be updated by recursive crawling
+                    successful_scraped = len(scraped_data)
+                    
+                    # Get actual metrics from the scraping process
+                    if hasattr(self, 'metrics') and hasattr(self.metrics, 'total_urls'):
+                        total_attempted = max(self.metrics.total_urls, len(urls))
+                    
+                    success_rate = (successful_scraped / total_attempted) * 100 if total_attempted > 0 else 0
+                    
+                    if successful_scraped == total_attempted:
+                        # Complete success
+                        pipeline_tracker.complete_step(self.job_id, "web_scraping", success=True)
+                        self.status.logs.append(f"✅ Successfully scraped all {successful_scraped} pages")
+                    elif successful_scraped > 0:
+                        # Partial success - mark as completed but with warning
+                        warning_msg = f"Partial success: {successful_scraped}/{total_attempted} pages scraped ({success_rate:.1f}% success rate)"
+                        pipeline_tracker.complete_step(self.job_id, "web_scraping", success=True, 
+                                                     error_message=warning_msg)
+                        self.status.logs.append(f"⚠️ {warning_msg}")
+                    else:
+                        # This case should not happen if scraped_data has items, but keep as safeguard
+                        pipeline_tracker.complete_step(self.job_id, "web_scraping", success=False, 
+                                                     error_message="No content successfully scraped")
+                        self.status.logs.append("❌ No content successfully scraped from URLs")
+                    
+                    # Continue with processing the scraped data
+                    # Step 2: Process scraped content
+                    pipeline_tracker.start_step(self.job_id, "content_cleaning", len(scraped_data))
+                    self.status.current_step = "Processing Scraped Content"
+                    self.status.progress = 30
+                    websocket_manager.broadcast(self.status.dict())
+                    
+                    chunks = self._process_with_real_pipeline(scraped_data, websocket_manager)
+                    processed_chunks += len(chunks)
+                    pipeline_tracker.complete_step(self.job_id, "content_cleaning", success=True)
+                    
+                    # Step 3: Generate embeddings
+                    pipeline_tracker.start_step(self.job_id, "embedding_generation", len(chunks))
+                    
+                    self.status.current_step = "Generating Embeddings"
+                    self.status.progress = 80
+                    self.status.logs.append("Generating vector embeddings...")
+                    websocket_manager.broadcast(self.status.dict())
+                    
+                    embeddings_data = self._generate_embeddings(chunks, websocket_manager)
+                    generated_embeddings += len(embeddings_data)
+                    
+                    pipeline_tracker.complete_step(self.job_id, "embedding_generation", success=True)
+                    
+                    self.status.logs.append(f"Generated embeddings for {len(embeddings_data)} chunks")
+                    websocket_manager.broadcast(self.status.dict())
+                    
+                    # Step 4: Upload to vector database with deduplication
+                    pipeline_tracker.start_step(self.job_id, "database_upload", len(embeddings_data))
+                    
+                    self.status.current_step = "Storing Vectors"
+                    self.status.progress = 90
+                    self.status.logs.append("Uploading vectors to database with deduplication...")
+                    websocket_manager.broadcast(self.status.dict())
+                    
+                    upload_results = self._upload_to_vector_db_with_dedup(embeddings_data, websocket_manager)
+                    uploaded_vectors += upload_results.get('uploaded_count', 0)
+                    
+                    pipeline_tracker.complete_step(self.job_id, "database_upload", success=True)
+                else:
+                    # Complete failure - no pages scraped successfully
+                    total_attempted = len(urls)
+                    if hasattr(self, 'metrics') and hasattr(self.metrics, 'total_urls'):
+                        total_attempted = max(self.metrics.total_urls, len(urls))
+                    
+                    pipeline_tracker.complete_step(self.job_id, "web_scraping", success=False, 
+                                                 error_message=f"Failed to scrape any content from {total_attempted} URLs")
+                    self.status.logs.append(f"❌ Failed to scrape any content from {total_attempted} URLs")
+                    
+                    # Skip web scraping related steps since no content was scraped
+                    if has_uploads:
+                        # We have uploads to process, so skip web-scraping-specific steps
+                        pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No web content scraped, using uploaded files")
+                    else:
+                        # No uploads either, skip content processing steps
+                        pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No content to clean")
+                        pipeline_tracker.skip_step(self.job_id, "text_chunking", "No content to chunk")
+                        pipeline_tracker.skip_step(self.job_id, "embedding_generation", "No content to embed")
+                        pipeline_tracker.skip_step(self.job_id, "deduplication", "No content to deduplicate")
+                        pipeline_tracker.skip_step(self.job_id, "database_upload", "No content to upload")
+            
+            if has_uploads:
+                if not has_urls:  # Only start if not already started for URLs
+                    pipeline_tracker.start_step(self.job_id, "content_cleaning")
+                
+                self.status.logs.append("Processing uploaded files...")
                 websocket_manager.broadcast(self.status.dict())
                 
                 # Step 1: Create scraped data from uploads
                 self.status.current_step = "Processing Uploads"
-                self.status.progress = 10
+                self.status.progress = 50
                 scraped_data_file = self._create_scraped_data_from_uploads(upload_dir)
                 self.status.logs.append(f"Created data file: {scraped_data_file}")
                 websocket_manager.broadcast(self.status.dict())
                 
                 # Step 2: Advanced text processing and chunking
+                pipeline_tracker.start_step(self.job_id, "text_chunking")
                 self.status.current_step = "Text Processing & Chunking"
-                self.status.progress = 30
-                self.status.logs.append("Processing and chunking text content...")
+                self.status.progress = 60
                 websocket_manager.broadcast(self.status.dict())
                 
                 # Load the scraped data
@@ -334,57 +570,259 @@ class PipelineJob:
                 
                 # Use the real text processor
                 all_chunks = self._process_with_real_pipeline(scraped_data, websocket_manager)
+                processed_chunks += len(all_chunks)
+                pipeline_tracker.complete_step(self.job_id, "text_chunking", success=True)
                 
                 self.status.logs.append(f"Created {len(all_chunks)} text chunks")
-                self.status.progress = 50
+                self.status.progress = 70
                 websocket_manager.broadcast(self.status.dict())
                 
                 # Step 3: Generate embeddings
+                pipeline_tracker.start_step(self.job_id, "embedding_generation", len(all_chunks))
+                
                 self.status.current_step = "Generating Embeddings"
-                self.status.progress = 70
+                self.status.progress = 80
                 self.status.logs.append("Generating vector embeddings...")
                 websocket_manager.broadcast(self.status.dict())
                 
                 embeddings_data = self._generate_embeddings(all_chunks, websocket_manager)
+                generated_embeddings += len(embeddings_data)
+                
+                pipeline_tracker.complete_step(self.job_id, "embedding_generation", success=True)
                 
                 self.status.logs.append(f"Generated embeddings for {len(embeddings_data)} chunks")
-                self.status.progress = 85
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Step 4: Upload to vector database
+                # Step 4: Upload to vector database with deduplication
+                pipeline_tracker.start_step(self.job_id, "database_upload", len(embeddings_data))
+                
                 self.status.current_step = "Storing Vectors"
                 self.status.progress = 90
-                self.status.logs.append("Uploading vectors to database...")
+                self.status.logs.append("Uploading vectors to database with deduplication...")
                 websocket_manager.broadcast(self.status.dict())
                 
-                upload_results = self._upload_to_vector_db(embeddings_data, websocket_manager)
+                upload_results = self._upload_to_vector_db_with_dedup(embeddings_data, websocket_manager)
+                uploaded_vectors += upload_results.get('uploaded_count', 0)
                 
-                self.status.logs.append(f"✅ Uploaded {upload_results.get('uploaded_count', 0)} vectors to database")
-                self.status.progress = 100
-                self.status.current_step = "Complete"
-                websocket_manager.broadcast(self.status.dict())
+                pipeline_tracker.complete_step(self.job_id, "database_upload", success=True)
+            
+            if not has_urls and not has_uploads:
+                # Skip all content processing steps when no data
+                pipeline_tracker.skip_step(self.job_id, "web_scraping", "No URLs provided")
+                pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No content to clean")
+                pipeline_tracker.skip_step(self.job_id, "text_chunking", "No content to chunk")
+                pipeline_tracker.skip_step(self.job_id, "embedding_generation", "No content to embed")
+                pipeline_tracker.skip_step(self.job_id, "deduplication", "No content to deduplicate")
+                pipeline_tracker.skip_step(self.job_id, "database_upload", "No content to upload")
                 
-                return {
-                    'success': True,
-                    'processed_chunks': len(all_chunks),
-                    'generated_embeddings': len(embeddings_data),
-                    'uploaded_vectors': upload_results.get('uploaded_count', 0),
-                    'pipeline_completed_at': datetime.now().isoformat()
-                }
-            else:
-                # No uploaded files, check for URLs
-                urls_file = Path("data/raw/urls.txt")
-                if urls_file.exists():
-                    self.status.logs.append("Found URLs file, but web scraping not implemented in standalone mode")
-                    return {'success': False, 'error': 'Web scraping not implemented in standalone mode'}
-                else:
-                    return {'success': False, 'error': 'No data to process - no uploaded files or URLs found'}
+                # Still complete finalization step
+                pipeline_tracker.start_step(self.job_id, "finalization")
+                pipeline_tracker.complete_step(self.job_id, "finalization", success=False, 
+                                             error_message="No data to process - no URLs or uploaded files found")
+                pipeline_tracker.complete_job(self.job_id, success=False, 
+                                            error_message="No data to process - no URLs or uploaded files found")
+                
+                return {'success': False, 'error': 'No data to process - no URLs or uploaded files found'}
+            
+            # Skip unused steps based on what data we have
+            if not has_uploads:
+                # Skip file processing step when only URLs provided
+                pipeline_tracker.skip_step(self.job_id, "file_processing", "No files uploaded")
+            
+            # Skip remaining steps if not used and finalize job
+            if not has_urls:
+                pipeline_tracker.skip_step(self.job_id, "web_scraping", "No URLs provided")
+            if not has_uploads and not has_urls:
+                pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No content to clean")
+                pipeline_tracker.skip_step(self.job_id, "text_chunking", "No content to chunk")
+                pipeline_tracker.skip_step(self.job_id, "embedding_generation", "No content to embed")
+                pipeline_tracker.skip_step(self.job_id, "deduplication", "No content to deduplicate")
+                pipeline_tracker.skip_step(self.job_id, "database_upload", "No content to upload")
+            
+            # Mark finalization step
+            pipeline_tracker.start_step(self.job_id, "finalization")
+            
+            self.status.logs.append(f"✅ Pipeline completed: {processed_chunks} chunks, {generated_embeddings} embeddings, {uploaded_vectors} new vectors")
+            self.status.progress = 100
+            self.status.current_step = "Complete"
+            websocket_manager.broadcast(self.status.dict())
+            
+            # Complete finalization and job
+            pipeline_tracker.complete_step(self.job_id, "finalization", success=True)
+            pipeline_tracker.complete_job(self.job_id, success=True)
+            
+            return {
+                'success': True,
+                'processed_chunks': processed_chunks,
+                'generated_embeddings': generated_embeddings,
+                'uploaded_vectors': uploaded_vectors,
+                'pipeline_completed_at': datetime.now().isoformat()
+            }
                     
         except Exception as e:
             logger.error(f"Standalone pipeline failed: {str(e)}")
             import traceback
             traceback.print_exc()
             return {'success': False, 'error': str(e)}
+    
+    async def _scrape_urls(self, urls: List[str], websocket_manager):
+        """Scrape content from URLs using recursive crawling with dynamic link discovery"""
+        try:
+            from src.scraper.orchestrator import ScrapingOrchestrator
+            from src.scraper.url_discovery import URLDiscovery
+            
+            # Initialize components
+            orchestrator = ScrapingOrchestrator()
+            url_discovery = URLDiscovery()
+            
+            # Track discovered URLs and already processed ones
+            discovered_urls = set(urls)  # Start with user-provided URLs
+            processed_urls = set()
+            scraped_pages = []
+            
+            # Determine base domain for crawling scope
+            base_domain = None
+            if urls:
+                from urllib.parse import urlparse
+                base_domain = urlparse(urls[0]).netloc
+                pipeline_tracker.add_log(self.job_id, f"Starting recursive crawling for domain: {base_domain}")
+            else:
+                pipeline_tracker.add_log(self.job_id, "No URLs provided for crawling", 'WARNING')
+                return []
+            
+            websocket_manager.broadcast(self._get_enhanced_status())
+            
+            # Recursive crawling loop
+            crawl_depth = 0
+            max_depth = 5  # Prevent infinite crawling
+            
+            while discovered_urls and crawl_depth < max_depth:
+                crawl_depth += 1
+                
+                # Update metrics
+                self.metrics.total_urls = len(discovered_urls)
+                self._update_metrics()
+                
+                pipeline_tracker.add_log(self.job_id, f"Crawl depth {crawl_depth}: {len(discovered_urls)} URLs to process")
+                websocket_manager.broadcast(self._get_enhanced_status())
+                
+                # Get URLs to process in this iteration
+                current_batch = list(discovered_urls - processed_urls)
+                
+                if not current_batch:
+                    break
+                
+                # Limit batch size to prevent overwhelming
+                batch_size = min(20, len(current_batch))
+                current_batch = current_batch[:batch_size]
+                
+                for i, url in enumerate(current_batch):
+                    if self.should_stop.is_set():
+                        break
+                    
+                    # Skip if already processed
+                    if url in processed_urls:
+                        continue
+                    
+                    pipeline_tracker.add_log(self.job_id, f"Scraping ({i+1}/{len(current_batch)}): {url}")
+                    websocket_manager.broadcast(self._get_enhanced_status())
+                    
+                    try:
+                        # Scrape the page
+                        page_data = await orchestrator.scrape_single_page(url)
+                        
+                        if page_data and (page_data.get('content') or page_data.get('text')):
+                            scraped_pages.append(page_data)
+                            processed_urls.add(url)
+                            
+                            # Update success metrics
+                            self.metrics.processed_urls = len(processed_urls)
+                            self.metrics.successful_urls = len(scraped_pages)
+                            self._update_metrics()
+                            
+                            # Extract new links from this page
+                            page_content = page_data.get('content', '')
+                            new_urls = url_discovery.discover_urls_from_page(page_content, url)
+                            
+                            # Filter new URLs to same domain and validate
+                            valid_new_urls = []
+                            for new_url in new_urls:
+                                try:
+                                    from urllib.parse import urlparse
+                                    new_domain = urlparse(new_url).netloc
+                                    
+                                    # Only add URLs from the same domain
+                                    if (new_domain == base_domain and 
+                                        new_url not in processed_urls and 
+                                        new_url not in discovered_urls and
+                                        url_discovery.validate_url(new_url, base_domain)):
+                                        
+                                        valid_new_urls.append(new_url)
+                                        
+                                except Exception:
+                                    continue
+                            
+                            # Add new URLs to discovery queue
+                            if valid_new_urls:
+                                discovered_urls.update(valid_new_urls)
+                                self.metrics.total_urls = len(discovered_urls)
+                                pipeline_tracker.add_log(self.job_id, f"Found {len(valid_new_urls)} new links on {url}")
+                            
+                            pipeline_tracker.add_log(self.job_id, f"✅ Successfully scraped: {url}")
+                            
+                        else:
+                            processed_urls.add(url)  # Mark as processed even if failed
+                            self.metrics.processed_urls = len(processed_urls)
+                            self.metrics.failed_urls = self.metrics.processed_urls - self.metrics.successful_urls
+                            self._update_metrics()
+                            pipeline_tracker.add_log(self.job_id, f"❌ Failed to scrape: {url}")
+                            
+                    except Exception as e:
+                        processed_urls.add(url)
+                        self.metrics.processed_urls = len(processed_urls)
+                        self.metrics.failed_urls = self.metrics.processed_urls - self.metrics.successful_urls
+                        self._update_metrics()
+                        pipeline_tracker.add_log(self.job_id, f"❌ Error scraping {url}: {str(e)}")
+                    
+                    # Update progress
+                    total_discovered = len(discovered_urls)
+                    total_processed = len(processed_urls)
+                    progress = 10 + (total_processed / max(total_discovered, 1)) * 15  # 10-25% for scraping
+                    self.status.progress = int(progress)
+                    websocket_manager.broadcast(self._get_enhanced_status())
+                
+                # Log progress after each depth level
+                total_discovered = len(discovered_urls)
+                total_processed = len(processed_urls)
+                remaining = total_discovered - total_processed
+                
+                pipeline_tracker.add_log(self.job_id, f"Depth {crawl_depth} complete: {total_processed} processed, {remaining} remaining, {len(scraped_pages)} successful")
+                websocket_manager.broadcast(self._get_enhanced_status())
+                
+                # Break if no new URLs were discovered
+                if remaining == 0:
+                    break
+            
+            # Final summary
+            total_discovered = len(discovered_urls)
+            total_processed = len(processed_urls)
+            
+            pipeline_tracker.add_log(self.job_id, f"🎯 Recursive crawling completed!")
+            pipeline_tracker.add_log(self.job_id, f"📈 Total discovered URLs: {total_discovered}")
+            pipeline_tracker.add_log(self.job_id, f"✅ Successfully scraped: {len(scraped_pages)}")
+            pipeline_tracker.add_log(self.job_id, f"🚫 Failed/skipped: {total_processed - len(scraped_pages)}")
+            pipeline_tracker.add_log(self.job_id, f"🔄 Maximum crawl depth: {crawl_depth}")
+            
+            websocket_manager.broadcast(self._get_enhanced_status())
+            
+            return scraped_pages
+            
+        except ImportError as e:
+            pipeline_tracker.add_log(self.job_id, f"❌ Scraping components not available: {e}", 'ERROR')
+            return []
+        except Exception as e:
+            pipeline_tracker.add_log(self.job_id, f"❌ Recursive crawling failed: {str(e)}", 'ERROR')
+            return []
     
     def _simple_text_chunking(self, text: str, url: str):
         """Simple text chunking without external dependencies"""
@@ -423,15 +861,15 @@ class PipelineJob:
         return chunks
     
     def _process_with_real_pipeline(self, scraped_data, websocket_manager):
-        """Process text using the real text processing pipeline"""
+        """Process scraped data using the real text processor"""
         try:
-            # Import the real text processor
-            from src.processor.text_processor import TextProcessor, ChunkingConfig
+            from src.processor.text_processor import TextProcessor
+            from src.processor.text_processor import ChunkingConfig
             
             # Create chunking configuration
             chunking_config = ChunkingConfig(
-                max_chunk_size=800,
-                min_chunk_size=50,
+                max_chunk_size=1000,
+                min_chunk_size=100,
                 overlap_size=100,
                 split_by_sentences=True,
                 preserve_paragraphs=True,
@@ -441,14 +879,21 @@ class PipelineJob:
             # Initialize text processor
             text_processor = TextProcessor(chunking_config)
             
+            # Handle both list and dict formats
+            if isinstance(scraped_data, list):
+                pages = scraped_data
+            else:
+                pages = scraped_data.get('pages', [])
+            
             # Process each page
             all_chunks = []
-            for page in scraped_data.get('pages', []):
+            for page in pages:
                 try:
                     chunks = text_processor.process_page_content(page)
                     all_chunks.extend(chunks)
                 except Exception as e:
-                    logger.error(f"Failed to process page {page.get('url', 'unknown')}: {e}")
+                    page_url = page.get('url', 'unknown') if isinstance(page, dict) else 'unknown'
+                    logger.error(f"Failed to process page {page_url}: {e}")
                     continue
             
             return all_chunks
@@ -458,17 +903,33 @@ class PipelineJob:
             # Fallback to simple chunking
             return self._simple_fallback_chunking(scraped_data)
         except Exception as e:
-            logger.error(f"Text processing failed: {e}")
+            error_msg = f"Text processing failed: {e}"
+            logger.error(error_msg)
+            pipeline_tracker.add_log(self.job_id, error_msg, 'ERROR')
             # Fallback to simple chunking
             return self._simple_fallback_chunking(scraped_data)
     
     def _simple_fallback_chunking(self, scraped_data):
         """Fallback simple chunking if real processor fails"""
         all_chunks = []
-        for page in scraped_data.get('pages', []):
-            content = page.get('content', '')
+        
+        # Handle both list and dict formats
+        if isinstance(scraped_data, list):
+            pages = scraped_data
+        else:
+            pages = scraped_data.get('pages', [])
+        
+        for page in pages:
+            # Handle different page formats
+            if isinstance(page, dict):
+                content = page.get('text', '') or page.get('content', '')
+                url = page.get('url', '')
+            else:
+                content = str(page)
+                url = ''
+                
             if content and content.strip():
-                chunks = self._simple_text_chunking(content, page.get('url', ''))
+                chunks = self._simple_text_chunking(content, url)
                 all_chunks.extend(chunks)
         return all_chunks
     
@@ -538,8 +999,8 @@ class PipelineJob:
             logger.error(f"Embedding generation failed: {e}")
             raise
     
-    def _upload_to_vector_db(self, embeddings_data, websocket_manager):
-        """Upload embeddings to Qdrant vector database"""
+    def _upload_to_vector_db_with_dedup(self, embeddings_data, websocket_manager):
+        """Upload embeddings to Qdrant vector database with deduplication"""
         try:
             from src.database.qdrant_client import QdrantManager
             from src.database.models import VectorConfig
@@ -588,20 +1049,68 @@ class PipelineJob:
             
             websocket_manager.broadcast(self.status.dict())
             
-            # Prepare embeddings data for upload (already in correct format)
-            # embeddings_data already contains: chunk_id, text, embedding, metadata
-            self.status.logs.append(f"Uploading {len(embeddings_data)} vectors to collection {config.collection_name}...")
+            # Deduplication: Get all existing content hashes in one batch operation
+            pipeline_tracker.start_step(self.job_id, "deduplication", len(embeddings_data))
+            self.status.logs.append("Checking for duplicate content (batch operation)...")
             websocket_manager.broadcast(self.status.dict())
             
+            # Get all existing content hashes from the database in one operation
+            existing_hashes = qdrant_manager.get_existing_content_hashes()
+            
+            new_embeddings = []
+            duplicate_count = 0
+            
+            for i, embedding_data in enumerate(embeddings_data):
+                # Create a hash of the text content for deduplication
+                text_content = embedding_data.get('text', '')
+                content_hash = hashlib.md5(text_content.encode('utf-8')).hexdigest()
+                
+                # Add content hash to metadata for future deduplication
+                if 'metadata' not in embedding_data:
+                    embedding_data['metadata'] = {}
+                embedding_data['metadata']['content_hash'] = content_hash
+                
+                # Check if this content already exists using the batch-loaded hashes
+                if content_hash not in existing_hashes:
+                    new_embeddings.append(embedding_data)
+                    # Add to existing hashes to avoid duplicates within this batch
+                    existing_hashes.add(content_hash)
+                else:
+                    duplicate_count += 1
+                    logger.info(f"Skipping duplicate content: {content_hash[:12]}...")
+                
+                # Update progress every 50 items (less frequent updates)
+                if (i + 1) % 50 == 0:
+                    pipeline_tracker.update_step_progress(self.job_id, "deduplication", i + 1)
+                    self.status.logs.append(f"Processed {i + 1}/{len(embeddings_data)} chunks for deduplication")
+                    websocket_manager.broadcast(self.status.dict())
+            
+            pipeline_tracker.complete_step(self.job_id, "deduplication", success=True)
+            self.status.logs.append(f"Found {len(new_embeddings)} new chunks, {duplicate_count} duplicates skipped")
+            websocket_manager.broadcast(self.status.dict())
+            
+            if not new_embeddings:
+                self.status.logs.append("No new content to upload - all content already exists")
+                return {
+                    'uploaded_count': 0,
+                    'failed_count': 0,
+                    'duplicate_count': duplicate_count,
+                    'success': True
+                }
+            
             # Upload vectors using the QdrantManager
+            self.status.logs.append(f"Uploading {len(new_embeddings)} vectors to collection {config.collection_name}...")
+            websocket_manager.broadcast(self.status.dict())
+            
             upload_result = qdrant_manager.upload_vectors(
-                embeddings=embeddings_data,
+                embeddings=new_embeddings,
                 progress_callback=lambda **kwargs: self.status.logs.append(f"Upload progress: {kwargs}")
             )
             
             return {
                 'uploaded_count': upload_result.uploaded_vectors,
                 'failed_count': upload_result.failed_vectors,
+                'duplicate_count': duplicate_count,
                 'success_rate': upload_result.success_rate,
                 'collection_name': config.collection_name,
                 'success': upload_result.success
@@ -656,24 +1165,40 @@ class PipelineJob:
                 self.status.progress = 60
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Step 3: Generate embeddings (simplified)
+                # Step 3: Generate embeddings
+                pipeline_tracker.start_step(self.job_id, "embedding_generation", len(all_chunks))
+                
                 self.status.current_step = "Generating Embeddings"
                 self.status.progress = 80
                 self.status.logs.append("Generating embeddings...")
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Simulate embedding generation for now to avoid complex dependencies
-                import time
-                time.sleep(2)
+                embeddings_data = self._generate_embeddings(all_chunks, websocket_manager)
+                generated_embeddings += len(embeddings_data)
                 
-                self.status.logs.append(f"Generated embeddings for {len(all_chunks)} chunks")
-                self.status.progress = 100
-                self.status.current_step = "Complete"
+                pipeline_tracker.complete_step(self.job_id, "embedding_generation", success=True)
+                
+                self.status.logs.append(f"Generated embeddings for {len(embeddings_data)} chunks")
                 websocket_manager.broadcast(self.status.dict())
+                
+                # Step 4: Upload to vector database with deduplication
+                pipeline_tracker.start_step(self.job_id, "database_upload", len(embeddings_data))
+                
+                self.status.current_step = "Storing Vectors"
+                self.status.progress = 90
+                self.status.logs.append("Uploading vectors to database with deduplication...")
+                websocket_manager.broadcast(self.status.dict())
+                
+                upload_results = self._upload_to_vector_db_with_dedup(embeddings_data, websocket_manager)
+                uploaded_vectors += upload_results.get('uploaded_count', 0)
+                
+                pipeline_tracker.complete_step(self.job_id, "database_upload", success=True)
                 
                 return {
                     'success': True,
                     'processed_chunks': len(all_chunks),
+                    'generated_embeddings': generated_embeddings,
+                    'uploaded_vectors': uploaded_vectors,
                     'pipeline_completed_at': datetime.now().isoformat()
                 }
             else:
@@ -951,10 +1476,37 @@ async def root():
 
 @app.get("/pipeline/status")
 async def get_pipeline_status():
-    """Get current pipeline status"""
-    if current_job:
-        return current_job.status.dict()
-    else:
+    """Get current pipeline status with enhanced metrics"""
+    global current_job
+    
+    try:
+        if current_job and current_job.job_id in active_jobs:
+            # Return enhanced status for running job
+            return current_job._get_enhanced_status()
+        
+        # Check if any jobs are running in database
+        active_jobs_list = pipeline_tracker.get_active_jobs()
+        if active_jobs_list:
+            latest_job = active_jobs_list[0]
+            return {
+                "job_id": latest_job.job_id,
+                "is_running": True,
+                "status": latest_job.status,
+                "metrics": latest_job.metrics.__dict__ if latest_job.metrics else None
+            }
+        
+        # No active jobs
+        return {
+            "is_running": False,
+            "progress": 0,
+            "current_step": "Idle",
+            "logs": [],
+            "metrics": None,
+            "job_id": None
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get pipeline status: {str(e)}")
         return PipelineStatus().dict()
 
 
@@ -988,15 +1540,22 @@ async def start_pipeline(
             logger.error(f"Failed to read file {file.filename}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to read file {file.filename}: {e}")
     
-    # Create new job
+    # Create new job with enhanced tracking
     job_id = str(uuid.uuid4())
     current_job = PipelineJob(job_id)
+    active_jobs[job_id] = current_job
     
     # Start the pipeline with file data instead of UploadFile objects
     current_job.start(file_data, urls, websocket_manager)
     
     logger.info(f"Started pipeline job: {job_id}")
-    return {"message": "Pipeline started", "job_id": job_id}
+    return {
+        "message": "Pipeline started with enhanced tracking", 
+        "job_id": job_id,
+        "input_files": len(file_data),
+        "input_urls": len(urls),
+        "tracking_enabled": True
+    }
 
 
 @app.post("/pipeline/stop")
@@ -1031,8 +1590,250 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0"
+    }
 
+# New enhanced tracking endpoints
+
+@app.get("/pipeline/jobs")
+async def get_job_history():
+    """Get pipeline job history"""
+    try:
+        jobs = pipeline_tracker.get_job_history(limit=20)
+        return {
+            "jobs": [
+                {
+                    "job_id": job.job_id,
+                    "status": job.status,
+                    "start_time": job.start_time,
+                    "end_time": job.end_time,
+                    "input_urls": job.input_urls,
+                    "metrics": job.metrics.__dict__ if job.metrics else None,
+                    "error_message": job.error_message
+                }
+                for job in jobs
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get job history: {str(e)}")
+
+@app.get("/pipeline/jobs/{job_id}")
+async def get_job_details(job_id: str):
+    """Get detailed information about a specific job"""
+    try:
+        job = pipeline_tracker.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "start_time": job.start_time,
+            "end_time": job.end_time,
+            "input_urls": job.input_urls,
+            "metrics": job.metrics.__dict__ if job.metrics else None,
+            "logs": job.logs,
+            "error_message": job.error_message,
+            "steps": [
+                {
+                    "name": step.step_name,
+                    "order": step.step_order,
+                    "status": step.status,
+                    "progress": step.progress_percentage,
+                    "items_processed": step.items_processed,
+                    "items_total": step.items_total,
+                    "start_time": step.start_time,
+                    "end_time": step.end_time,
+                    "duration": step.duration,
+                    "error_message": step.error_message
+                }
+                for step in job.steps
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get job details: {str(e)}")
+
+@app.get("/pipeline/stats")
+async def get_pipeline_stats():
+    """Get overall pipeline statistics"""
+    try:
+        stats = pipeline_tracker.get_job_stats()
+        active_jobs_list = pipeline_tracker.get_active_jobs()
+        
+        return {
+            "statistics": stats,
+            "active_jobs": len(active_jobs_list),
+            "active_job_ids": [job.job_id for job in active_jobs_list]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get pipeline stats: {str(e)}")
+
+@app.get("/pipeline/jobs/{job_id}/progress")
+async def get_job_progress(job_id: str):
+    """Get real-time progress for a specific job"""
+    try:
+        # Check if job is currently running
+        if job_id in active_jobs:
+            job = active_jobs[job_id]
+            status = job._get_enhanced_status()
+            
+            # Add step information
+            current_step = pipeline_tracker.get_current_step(job_id)
+            all_steps = pipeline_tracker.get_job_steps(job_id)
+            
+            status["current_step_info"] = {
+                "name": current_step.step_name if current_step else None,
+                "order": current_step.step_order if current_step else None,
+                "progress": current_step.progress_percentage if current_step else 0,
+                "items_processed": current_step.items_processed if current_step else 0,
+                "items_total": current_step.items_total if current_step else 0
+            }
+            
+            status["all_steps"] = [
+                {
+                    "name": step.step_name,
+                    "order": step.step_order,
+                    "status": step.status,
+                    "progress": step.progress_percentage,
+                    "items_processed": step.items_processed,
+                    "items_total": step.items_total,
+                    "duration": step.duration,
+                    "error_message": step.error_message
+                }
+                for step in all_steps
+            ]
+            
+            return status
+        
+        # Get from database for completed jobs
+        job = pipeline_tracker.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        current_step = pipeline_tracker.get_current_step(job_id)
+        all_steps = pipeline_tracker.get_job_steps(job_id)
+        
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "metrics": job.metrics.__dict__ if job.metrics else None,
+            "progress": 100 if job.status in ['completed', 'failed'] else 0,
+            "logs": job.logs[-10:] if job.logs else [],  # Last 10 logs
+            "current_step_info": {
+                "name": current_step.step_name if current_step else None,
+                "order": current_step.step_order if current_step else None,
+                "progress": current_step.progress_percentage if current_step else 0,
+                "items_processed": current_step.items_processed if current_step else 0,
+                "items_total": current_step.items_total if current_step else 0
+            },
+            "all_steps": [
+                {
+                    "name": step.step_name,
+                    "order": step.step_order,
+                    "status": step.status,
+                    "progress": step.progress_percentage,
+                    "items_processed": step.items_processed,
+                    "items_total": step.items_total,
+                    "duration": step.duration,
+                    "error_message": step.error_message
+                }
+                for step in all_steps
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get job progress: {str(e)}")
+
+@app.delete("/pipeline/jobs/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a running job"""
+    try:
+        if job_id in active_jobs:
+            job = active_jobs[job_id]
+            job.stop()
+            pipeline_tracker.complete_job(job_id, success=False, error_message="Job cancelled by user")
+            del active_jobs[job_id]
+            return {"message": f"Job {job_id} cancelled"}
+        else:
+            raise HTTPException(status_code=404, detail="Job not found or not running")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
+
+@app.post("/pipeline/cleanup")
+async def cleanup_old_jobs(days: int = 30):
+    """Clean up old completed jobs"""
+    try:
+        cleaned_count = pipeline_tracker.cleanup_old_jobs(days)
+        return {"message": f"Cleaned up {cleaned_count} jobs older than {days} days"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cleanup jobs: {str(e)}")
+
+@app.get("/pipeline/jobs/{job_id}/visualization")
+async def get_job_visualization(job_id: str):
+    """Get comprehensive visualization data for a pipeline job"""
+    try:
+        viz_data = pipeline_tracker.get_pipeline_visualization_data(job_id)
+        if not viz_data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        # Convert dataclasses to dicts for JSON serialization
+        result = {
+            'job': {
+                'job_id': viz_data['job'].job_id,
+                'status': viz_data['job'].status,
+                'start_time': viz_data['job'].start_time,
+                'end_time': viz_data['job'].end_time,
+                'input_urls': viz_data['job'].input_urls,
+                'metrics': viz_data['job'].metrics.__dict__ if viz_data['job'].metrics else None,
+                'error_message': viz_data['job'].error_message
+            },
+            'steps_with_logs': [
+                {
+                    'step': {
+                        'step_name': item['step'].step_name,
+                        'step_order': item['step'].step_order,
+                        'status': item['step'].status,
+                        'start_time': item['step'].start_time,
+                        'end_time': item['step'].end_time,
+                        'progress_percentage': item['step'].progress_percentage,
+                        'items_total': item['step'].items_total,
+                        'items_processed': item['step'].items_processed,
+                        'duration': item['step'].duration,
+                        'error_message': item['step'].error_message
+                    },
+                    'logs': item['logs']
+                }
+                for item in viz_data['steps_with_logs']
+            ],
+            'timeline': viz_data['timeline'],
+            'metrics_history': viz_data['metrics_history'],
+            'summary': viz_data['summary']
+        }
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get job visualization: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get job visualization: {str(e)}")
+
+@app.get("/pipeline/jobs/{job_id}/step/{step_name}/logs")
+async def get_step_logs(job_id: str, step_name: str):
+    """Get logs for a specific step"""
+    try:
+        logs = pipeline_tracker.get_step_logs(job_id, step_name)
+        return {"job_id": job_id, "step_name": step_name, "logs": logs}
+    except Exception as e:
+        logger.error(f"Failed to get step logs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get step logs: {str(e)}")
 
 if __name__ == "__main__":
     # Create necessary directories

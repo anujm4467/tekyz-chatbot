@@ -196,12 +196,13 @@ class URLDiscovery:
         
         return discovered
     
-    def validate_url(self, url: str) -> bool:
+    def validate_url(self, url: str, base_domain: str = None) -> bool:
         """
         Validate if URL should be scraped
         
         Args:
             url: URL to validate
+            base_domain: Base domain to restrict crawling to (optional)
             
         Returns:
             True if URL is valid for scraping
@@ -209,8 +210,46 @@ class URLDiscovery:
         if not url or not isinstance(url, str):
             return False
         
-        # Use the validation function from config
-        return is_valid_tekyz_url(url)
+        # Parse URL
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        
+        # Must be HTTP/HTTPS
+        if parsed.scheme not in ['http', 'https']:
+            return False
+        
+        # If base_domain is provided, restrict to that domain
+        if base_domain and parsed.netloc != base_domain:
+            return False
+        
+        # Check exclude patterns (file extensions, admin paths, etc.)
+        for pattern in EXCLUDE_PATTERNS:
+            if re.match(pattern, url, re.IGNORECASE):
+                return False
+        
+        # Additional checks for common unwanted patterns
+        unwanted_patterns = [
+            r'.*\.(jpg|jpeg|png|gif|svg|pdf|doc|docx|xls|xlsx|zip|tar|gz)$',
+            r'.*\.(css|js|ico|woff|woff2|ttf|eot)$',
+            r'.*/wp-admin/.*',
+            r'.*/wp-content/uploads/.*',
+            r'.*/wp-includes/.*',
+            r'.*#.*',  # Anchor links
+            r'.*\?print=.*',  # Print versions
+            r'.*\?pdf=.*',   # PDF versions
+            r'.*/feed/?$',   # RSS feeds
+            r'.*/rss/?$',    # RSS feeds
+            r'.*/atom/?$',   # Atom feeds
+        ]
+        
+        for pattern in unwanted_patterns:
+            if re.match(pattern, url, re.IGNORECASE):
+                return False
+        
+        return True
     
     def get_all_urls(self) -> List[str]:
         """
