@@ -1,60 +1,70 @@
-# FastAPI and Web Framework
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.4.2
+# FastAPI and Web Framework - Latest versions
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
 
-# AI and LLM Integration
+# AI and LLM Integration - Latest versions
 groq==0.29.0
 
-# Vector Database and Search
-qdrant-client==1.6.4
-sentence-transformers==2.2.2
+# Vector Database and Search - Stable compatible versions
+qdrant-client==1.14.3
+sentence-transformers==3.2.0
 
-# Machine Learning and NLP
-transformers==4.35.0
-torch==2.1.0
-numpy==1.24.3
-scikit-learn==1.3.2
+# Machine Learning and NLP - Stable compatible versions
+transformers==4.44.2
+torch==2.4.1
+torchvision==0.19.1
+numpy==1.26.4
+scikit-learn==1.5.2
 
-# Data Processing
-pandas==2.1.3
-python-docx==0.8.11
+# Data Processing - Latest versions
+pandas==2.2.3
+python-docx==1.1.2
 PyPDF2==3.0.1
-beautifulsoup4==4.12.2
-lxml==4.9.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
 
-# HTTP and Web
-requests==2.31.0
-aiohttp==3.9.0
+# HTTP and Web - Latest versions
+requests==2.32.4
+aiohttp==3.10.11
+urllib3==2.2.3
+certifi==2024.12.14
 
-# Environment and Configuration
-python-dotenv==1.0.0
-PyYAML==6.0.1
+# Environment and Configuration - Latest versions
+python-dotenv==1.0.1
+PyYAML==6.0.2
 
-# Logging and Analytics
-loguru==0.7.2
+# Logging and Analytics - Latest versions
+loguru==0.7.3
 
-# Utilities
-typing-extensions==4.10.0
+# Utilities - Latest versions
+typing-extensions==4.12.2
 pathlib2==2.3.7
 
-# Text Processing
-nltk==3.8.1
-spacy==3.7.2
+# Text Processing - Latest versions
+nltk==3.9.1
+spacy==3.8.3
 
-# Development and Testing
-pytest==7.4.3
-pytest-asyncio==0.21.1
+# Development and Testing - Latest versions
+pytest==8.3.4
+pytest-asyncio==0.24.0
 
-# Database and Storage
-json5==0.9.14
+# Database and Storage - Latest versions
+json5==0.10.0
 
-# Date and Time
+# Date and Time - Latest versions
 python-dateutil==2.8.2
 
-# Web Scraping (if needed)
-selenium==4.15.2
+# Web Scraping - Latest versions
+selenium==4.27.1
 
-# Additional utilities for FastAPI
-python-multipart==0.0.6
-email-validator==2.1.0 
+# Additional utilities for FastAPI - Latest versions
+python-multipart==0.0.20
+email-validator==2.1.2
+
+# Additional required packages for compatibility
+brotli==1.1.0
+packaging==24.2
+tqdm==4.67.1
+psutil==6.1.0 

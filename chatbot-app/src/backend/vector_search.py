@@ -224,14 +224,38 @@ class VectorSearchEngine:
                     payload = hit.get('payload', {})
                     metadata = payload.get('metadata', {})
                     
-                    # Extract text from various possible locations
-                    text_content = (
-                        payload.get('text') or 
-                        payload.get('clean_text') or 
-                        metadata.get('text') or 
-                        metadata.get('clean_text') or
-                        f"Content from {metadata.get('source_url', 'unknown source')}"
-                    )
+                    # Extract text from the primary location (based on actual data structure)
+                    text_content = payload.get('text', '')  # This is the main field with contact info
+                    
+                    # Fallback to other possible locations if main field is empty
+                    if not text_content:
+                        text_content = (
+                            payload.get('content') or
+                            payload.get('clean_text') or
+                            payload.get('processed_text') or
+                            metadata.get('content') or
+                            metadata.get('text') or 
+                            metadata.get('clean_text') or
+                            metadata.get('processed_text') or
+                            payload.get('chunk_text') or
+                            payload.get('document_text') or
+                            str(payload.get('page_content', ''))
+                        )
+                    
+                    # Handle case where content is a dict with 'text' field
+                    if isinstance(text_content, dict):
+                        text_content = (
+                            text_content.get('text') or
+                            text_content.get('content') or 
+                            text_content.get('clean_text') or
+                            str(text_content)
+                        )
+                    
+                    # Ensure we have a string and handle any encoding issues
+                    text_content = str(text_content) if text_content else "No content available"
+                    
+                    # Clean up common artifacts that might interfere with display
+                    text_content = text_content.replace('\ufeff', '').replace('\u00a9', '©')
                     
                     # Create search result
                     search_result = SearchResult(

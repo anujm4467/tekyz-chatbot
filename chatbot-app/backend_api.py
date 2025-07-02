@@ -199,10 +199,15 @@ async def chat_endpoint(request: ChatRequest):
         
         # Search for relevant documents
         logger.info("Searching vector database...")
+        
+        # Use lower threshold for contact-related queries to catch specific info
+        is_contact_query = any(term in request.query.lower() for term in ['contact', 'email', 'phone', 'call', 'reach'])
+        threshold = 0.2 if is_contact_query else 0.3
+        
         search_results = vector_search.search(
             query=processed_query,
-            limit=5,
-            score_threshold=0.6
+            limit=10,
+            score_threshold=threshold
         )
         
         # Generate response
@@ -271,6 +276,41 @@ async def chat_endpoint(request: ChatRequest):
             processing_time=processing_time,
             timestamp=datetime.now().isoformat()
         )
+
+@app.post("/search")
+async def search_endpoint(request: dict):
+    """Direct search endpoint for testing"""
+    try:
+        query = request.get('query', '')
+        if not query:
+            raise HTTPException(status_code=400, detail="Query is required")
+            
+        vector_search = components.get('vector_search')
+        if not vector_search:
+            raise HTTPException(status_code=503, detail="Vector search not available")
+        
+        results = vector_search.search(
+            query=query,
+            limit=request.get('limit', 5),
+            score_threshold=request.get('threshold', 0.3)
+        )
+        
+        return {
+            "query": query,
+            "results": [
+                {
+                    "score": result.score,
+                    "content": result.text,
+                    "source": result.source_url,
+                    "metadata": result.metadata
+                }
+                for result in results
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/system/status")
 async def system_status():
