@@ -33,6 +33,12 @@ psutil==6.1.0
 # HTTP and networking - Latest versions
 urllib3==2.2.3
 certifi==2024.12.14
+aiohttp==3.10.11
+brotli==1.1.0
+
+# File processing - Latest versions
+python-docx==1.1.2
+PyPDF2==3.0.1
 
 # Additional dependencies - Latest versions
 typing-extensions==4.12.2

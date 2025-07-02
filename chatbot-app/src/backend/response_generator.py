@@ -26,22 +26,29 @@ class ResponseGenerator:
     - Handles off-topic queries gracefully
     """
     
+    
     def __init__(self):
         self.config = ConfigManager()
         self.logger = get_logger()
         self.groq_config = self.config.get_groq_config()
         
-        # Initialize Groq client
+        # Debug logging for Groq configuration
+        self.logger.info(f"DEBUG: Groq config retrieved: api_key={'present' if self.groq_config['api_key'] else 'MISSING'}")
+        if self.groq_config["api_key"]:
+            self.logger.info(f"DEBUG: API key length: {len(self.groq_config['api_key'])}")
+            self.logger.info(f"DEBUG: API key prefix: {self.groq_config['api_key'][:10]}...")
+        
+        # Initialize Groq client (Groq 0.29.0+ fixes proxies parameter issue)
         if self.groq_config["api_key"]:
             try:
                 self.groq_client = Groq(api_key=self.groq_config["api_key"])
-                self.logger.logger.info("Groq client initialized successfully for response generation")
+                self.logger.info("✅ Groq client initialized successfully for response generation")
             except Exception as e:
-                self.logger.logger.warning(f"Failed to initialize Groq client: {e}. Using fallback response generation.")
+                self.logger.error(f"❌ Failed to initialize Groq client: {e}")
                 self.groq_client = None
         else:
             self.groq_client = None
-            self.logger.logger.warning("Groq API key not provided. Response generation will be limited.")
+            self.logger.warning("❌ Groq API key not provided. Response generation will be limited.")
     
     def generate_response(
         self,
@@ -51,43 +58,60 @@ class ResponseGenerator:
         session_id: str = "default"
     ) -> ChatResponse:
         """
-        Generate a response using RAG approach.
+        Generate response using retrieved context.
         
         Args:
-            query: User's original query
-            context_results: Retrieved context from vector search
+            query: User query
+            context_results: Retrieved context chunks
             classification: Query classification result
             session_id: Session identifier for logging
             
         Returns:
-            Complete chat response with sources and metadata
+            Generated response with metadata
         """
         start_time = time.time()
         
         try:
-            # Handle off-topic queries
-            if classification and not classification.is_tekyz_related:
-                return self._create_decline_response(query, classification, start_time)
+            # Log response generation start
+            self.logger.info(f"Generating response for: '{query[:50]}...'")
             
-            # Handle no context found
-            if not context_results:
-                return self._create_no_context_response(query, start_time)
-            
-            # Generate response with context
+            # Attempt to use Groq AI for response generation
             if self.groq_client:
-                response_text = self._generate_with_groq(query, context_results)
+                self.logger.info("Attempting to generate response with Groq AI")
+                try:
+                    response_text = self._generate_with_groq(query, context_results, classification)
+                    self.logger.info(f"Successfully generated response with Groq AI")
+                except Exception as e:
+                    self.logger.error(f"Groq generation failed: {str(e)}")
+                    self.logger.info("Falling back to template-based response")
+                    response_text = self._generate_fallback_response(query, context_results)
             else:
+                self.logger.info("Groq client not available, using fallback response")
                 response_text = self._generate_fallback_response(query, context_results)
             
-            # Validate response
-            validation_result = self.validate_response(response_text, query)
-            
-            # Calculate confidence based on context quality and validation
-            confidence = self._calculate_confidence(context_results, validation_result)
-            
+            # Calculate processing time
             processing_time = time.time() - start_time
             
-            # Log response generation
+            # Determine confidence based on available context
+            confidence = self._calculate_confidence(context_results, classification)
+            
+            # Create response metadata
+            metadata = {
+                "session_id": session_id,
+                "processing_time": processing_time,
+                "context_sources": len(context_results),
+                "tekyz_related": classification.is_tekyz_related if classification else True,
+                "classification_confidence": classification.confidence if classification else 0.5,
+                "sources": [
+                    {
+                        "url": result.metadata.get("source_url", "Unknown"),
+                        "score": result.score,
+                        "snippet": result.text[:100] + "..." if len(result.text) > 100 else result.text
+                    } for result in context_results[:3]  # Top 3 sources
+                ]
+            }
+            
+            # Log successful response generation
             self.logger.log_response(response_text, session_id, processing_time)
             
             return ChatResponse(
@@ -99,11 +123,12 @@ class ResponseGenerator:
             )
             
         except Exception as e:
-            self.logger.log_error(e, "response_generation")
+            # Log error and return fallback response
             processing_time = time.time() - start_time
+            self.logger.error(f"Error in response_generation: {str(e)}")
             
             return ChatResponse(
-                response_text="I apologize, but I'm having trouble generating a response right now. Please try again in a moment.",
+                response_text="I apologize, but I'm experiencing technical difficulties. Please try again.",
                 sources=[],
                 classification=classification,
                 confidence=0.0,
@@ -111,13 +136,14 @@ class ResponseGenerator:
                 error_message=str(e)
             )
     
-    def _generate_with_groq(self, query: str, context_results: List[SearchResult]) -> str:
+    def _generate_with_groq(self, query: str, context_results: List[SearchResult], classification: Optional[ClassificationResult] = None) -> str:
         """
         Generate response using Groq AI with retrieved context.
         
         Args:
             query: User query
             context_results: Retrieved context chunks
+            classification: Query classification result
             
         Returns:
             Generated response text
@@ -142,7 +168,7 @@ class ResponseGenerator:
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            self.logger.log_error(e, "groq_response_generation")
+            self.logger.error(f"Error in groq_response_generation: {str(e)}")
             return self._generate_fallback_response(query, context_results)
     
     def _build_context_prompt(self, query: str, context_results: List[SearchResult]) -> str:
@@ -198,27 +224,67 @@ Based on the context provided above, here's what I can tell you about Tekyz:"""
         if not context_results:
             return "I'm sorry, but I don't have specific information about that topic in my knowledge base."
         
-        # Extract key information from top results
-        top_result = context_results[0]
-        response_parts = [
-            "Based on the information I have about Tekyz:",
-            "",
-            top_result.text[:300] + "..." if len(top_result.text) > 300 else top_result.text
-        ]
+        # Extract key information from search results
+        all_text = []
+        sources = []
+        for result in context_results[:3]:  # Use top 3 results
+            # Clean and extract text from result
+            text_content = result.text
+            if isinstance(text_content, str):
+                # Remove dictionary formatting if present
+                if text_content.startswith("{'text':"):
+                    try:
+                        import ast
+                        parsed = ast.literal_eval(text_content)
+                        if isinstance(parsed, dict) and 'text' in parsed:
+                            text_content = parsed['text']
+                    except:
+                        # If parsing fails, use string manipulation
+                        start = text_content.find("'text': '") + 9
+                        end = text_content.find("',", start)
+                        if start > 8 and end > start:
+                            text_content = text_content[start:end]
+                
+                all_text.append(text_content)
+                if hasattr(result, 'source_url') and result.source_url:
+                    sources.append(result.source_url)
         
-        if len(context_results) > 1:
-            response_parts.extend([
-                "",
-                "Additional relevant information:",
-                context_results[1].text[:200] + "..." if len(context_results[1].text) > 200 else context_results[1].text
-            ])
+        # Create a contextual response based on query type
+        query_lower = query.lower()
         
-        response_parts.extend([
-            "",
-            f"For more detailed information, you can visit: {top_result.source_url}"
-        ])
+        # Determine response style based on query
+        if any(word in query_lower for word in ['services', 'offer', 'provide', 'do']):
+            intro = "Based on the information I have about Tekyz's services:"
+        elif any(word in query_lower for word in ['team', 'who', 'people', 'staff']):
+            intro = "Here's what I know about the Tekyz team:"
+        elif any(word in query_lower for word in ['portfolio', 'projects', 'work', 'examples']):
+            intro = "Based on Tekyz's portfolio and project information:"
+        elif any(word in query_lower for word in ['contact', 'reach', 'address', 'phone', 'email']):
+            intro = "For contacting Tekyz:"
+        else:
+            intro = "Based on the information I have about Tekyz:"
         
-        return "\n".join(response_parts)
+        # Combine relevant text snippets
+        if all_text:
+            # Take the most relevant information
+            combined_text = ' '.join(all_text[:2])  # Limit to prevent too long responses
+            
+            # Clean up the text
+            combined_text = combined_text.replace('...', '. ')
+            if len(combined_text) > 500:
+                combined_text = combined_text[:500] + "..."
+            
+            response = f"{intro}\n\n{combined_text}"
+            
+            # Add source information if available
+            if sources:
+                unique_sources = list(set(sources))[:2]  # Max 2 unique sources
+                source_text = "\n\nFor more information, you can visit: " + ", ".join(unique_sources)
+                response += source_text
+                
+            return response
+        else:
+            return "I found some information in our knowledge base, but I'm having trouble processing it properly. Could you please rephrase your question?"
     
     def _create_decline_response(
         self, 
@@ -334,14 +400,14 @@ Based on the context provided above, here's what I can tell you about Tekyz:"""
     def _calculate_confidence(
         self, 
         context_results: List[SearchResult], 
-        validation_result: Dict[str, Any]
+        classification: Optional[ClassificationResult] = None
     ) -> float:
         """
         Calculate confidence score for the response.
         
         Args:
             context_results: Retrieved context chunks
-            validation_result: Response validation result
+            classification: Query classification result
             
         Returns:
             Confidence score between 0.0 and 1.0
@@ -355,11 +421,11 @@ Based on the context provided above, here's what I can tell you about Tekyz:"""
         # Adjust based on number of supporting results
         support_factor = min(len(context_results) / 3.0, 1.0)  # Max boost at 3+ results
         
-        # Adjust based on response validation
-        validation_factor = validation_result["quality_score"]
+        # Adjust based on classification
+        classification_factor = classification.confidence if classification else 0.5
         
         # Calculate final confidence
-        confidence = base_confidence * 0.6 + support_factor * 0.2 + validation_factor * 0.2
+        confidence = base_confidence * 0.6 + support_factor * 0.2 + classification_factor * 0.2
         
         return min(max(confidence, 0.0), 1.0)  # Clamp between 0 and 1
     

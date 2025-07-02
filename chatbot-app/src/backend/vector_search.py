@@ -96,8 +96,20 @@ class VectorSearchEngine:
                 collection_response.raise_for_status()
                 collection_info = collection_response.json()['result']
                 
+                # Try to load embedding model to verify it works
+                embedding_model_ready = False
+                try:
+                    self._load_embedding_model()
+                    embedding_model_ready = True
+                except Exception as e:
+                    logger.error(f"Failed to load embedding model: {e}")
+                
                 return {
                     'status': 'healthy',
+                    'qdrant_connection': True,
+                    'database_accessible': True,
+                    'embedding_model': embedding_model_ready,
+                    'ready_for_search': embedding_model_ready and collection_info.get('points_count', 0) > 0,
                     'collections': collections,
                     'target_collection': self.config.qdrant_collection,
                     'collection_exists': True,
@@ -107,6 +119,10 @@ class VectorSearchEngine:
             else:
                 return {
                     'status': 'degraded',
+                    'qdrant_connection': True,
+                    'database_accessible': False,
+                    'embedding_model': False,
+                    'ready_for_search': False,
                     'collections': collections,
                     'target_collection': self.config.qdrant_collection,
                     'collection_exists': False,
@@ -117,6 +133,10 @@ class VectorSearchEngine:
             logger.error(f"Vector database health check failed: {e}")
             return {
                 'status': 'unhealthy',
+                'qdrant_connection': False,
+                'database_accessible': False,
+                'embedding_model': False,
+                'ready_for_search': False,
                 'error': str(e)
             }
     

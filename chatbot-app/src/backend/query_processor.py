@@ -31,17 +31,18 @@ class QueryProcessor:
         self.logger = get_logger()
         self.groq_config = self.config.get_groq_config()
         
-        # Initialize Groq client
+        # Initialize Groq client (Groq 0.29.0+ fixes proxies parameter issue)
         if self.groq_config["api_key"]:
             try:
                 self.groq_client = Groq(api_key=self.groq_config["api_key"])
-                self.logger.logger.info("Groq client initialized successfully")
+                self.logger.info("✅ Groq client initialized successfully in QueryProcessor")
             except Exception as e:
-                self.logger.logger.warning(f"Failed to initialize Groq client: {e}. Using fallback logic.")
+                self.logger.error(f"❌ Failed to initialize Groq client in QueryProcessor: {e}")
+                self.logger.info("Using fallback classification logic")
                 self.groq_client = None
         else:
             self.groq_client = None
-            self.logger.logger.warning("Groq API key not provided. Classification will use fallback logic.")
+            self.logger.warning("❌ Groq API key not provided. Classification will use fallback logic.")
     
     def process_query(self, user_query: str, session_id: str = "default") -> Dict[str, Any]:
         """
@@ -93,7 +94,7 @@ class QueryProcessor:
             }
             
         except Exception as e:
-            self.logger.log_error(e, "query_processing")
+            self.logger.error(f"Error in query_processing: {str(e)}")
             return {
                 "success": False,
                 "error": f"Query processing failed: {str(e)}",
@@ -251,7 +252,7 @@ class QueryProcessor:
             )
             
         except Exception as e:
-            self.logger.log_error(e, "groq_classification")
+            self.logger.error(f"Error in groq_classification: {str(e)}")
             # Fallback to rule-based classification
             return self._classify_with_fallback(query)
     
@@ -269,69 +270,93 @@ class QueryProcessor:
         
         # Define keyword patterns for different categories
         tekyz_keywords = [
-            "tekyz", "tekyz.com", "your company", "your team", "your services"
+            "tekyz", "tekyz.com", "your company", "your team", "your services",
+            "you offer", "you provide", "your work", "your portfolio"
         ]
         
         service_keywords = [
-            "web development", "mobile app", "software development", 
+            "services", "web development", "mobile app", "software development", 
             "custom software", "development services", "programming",
-            "website", "app development", "software solutions"
+            "website", "app development", "software solutions", "what do you",
+            "what can you", "what services", "service", "develop", "build"
         ]
         
         portfolio_keywords = [
             "portfolio", "projects", "case studies", "previous work",
-            "examples", "clients", "past projects"
+            "examples", "clients", "past projects", "work", "project"
         ]
         
         company_keywords = [
             "about", "team", "company", "who are you", "background",
-            "history", "founders", "experience"
+            "history", "founders", "experience", "tell me about"
         ]
         
         contact_keywords = [
             "contact", "reach out", "get in touch", "email", "phone",
-            "consultation", "quote", "pricing"
+            "consultation", "quote", "pricing", "how to contact", "reach you"
         ]
         
-        # Check for Tekyz-specific mentions
-        is_tekyz_related = any(keyword in query_lower for keyword in tekyz_keywords)
+        # Check for explicit Tekyz mentions first
+        has_tekyz_mention = any(keyword in query_lower for keyword in tekyz_keywords)
         
-        # Determine category based on keywords
+        # Initialize defaults
+        is_tekyz_related = False
+        category = QueryCategory.OFF_TOPIC
+        confidence = 0.6
+        
+        # Determine category and relevance based on keywords
         if any(keyword in query_lower for keyword in service_keywords):
             category = QueryCategory.SERVICES
-            is_tekyz_related = True  # Services questions are Tekyz-related
+            is_tekyz_related = True  # Services questions are assumed to be about Tekyz
+            confidence = 0.85 if has_tekyz_mention else 0.75
         elif any(keyword in query_lower for keyword in portfolio_keywords):
             category = QueryCategory.PORTFOLIO
             is_tekyz_related = True
+            confidence = 0.85 if has_tekyz_mention else 0.75
         elif any(keyword in query_lower for keyword in company_keywords):
             category = QueryCategory.COMPANY
             is_tekyz_related = True
+            confidence = 0.85 if has_tekyz_mention else 0.75
         elif any(keyword in query_lower for keyword in contact_keywords):
             category = QueryCategory.CONTACT
             is_tekyz_related = True
+            confidence = 0.90  # Contact questions are highly likely to be relevant
+        elif has_tekyz_mention:
+            # If Tekyz is mentioned but doesn't fit other categories
+            category = QueryCategory.GENERAL
+            is_tekyz_related = True
+            confidence = 0.80
         else:
             # Check if it's a general business/tech question that might be relevant
             general_keywords = [
                 "how to", "what is", "best practices", "advice",
-                "recommendations", "help", "question"
+                "recommendations", "help", "question", "cost", "price",
+                "timeline", "process", "technology", "framework"
             ]
             
-            if any(keyword in query_lower for keyword in general_keywords):
+            tech_keywords = [
+                "software", "development", "technology", "digital",
+                "programming", "coding", "business", "web", "mobile",
+                "app", "application", "system", "solution"
+            ]
+            
+            has_general = any(keyword in query_lower for keyword in general_keywords)
+            has_tech = any(keyword in query_lower for keyword in tech_keywords)
+            
+            if has_general and has_tech:
                 category = QueryCategory.GENERAL
-                # General questions might be Tekyz-related if they mention relevant topics
-                tech_keywords = [
-                    "software", "development", "technology", "digital",
-                    "programming", "coding", "business"
-                ]
-                is_tekyz_related = any(keyword in query_lower for keyword in tech_keywords)
+                is_tekyz_related = True  # Tech questions could be relevant
+                confidence = 0.65
+            elif has_tech:
+                category = QueryCategory.SERVICES  # Tech questions likely about services
+                is_tekyz_related = True
+                confidence = 0.70
             else:
                 category = QueryCategory.OFF_TOPIC
                 is_tekyz_related = False
+                confidence = 0.80  # High confidence it's off-topic
         
-        # Calculate confidence based on keyword matches
-        confidence = 0.8 if is_tekyz_related else 0.6
-        
-        reasoning = f"Classified as {category.value} based on keyword analysis"
+        reasoning = f"Classified as {category.value} based on keyword analysis. Tekyz-related: {is_tekyz_related}"
         
         return ClassificationResult(
             is_tekyz_related=is_tekyz_related,

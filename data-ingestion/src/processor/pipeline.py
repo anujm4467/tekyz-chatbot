@@ -137,26 +137,42 @@ class ProcessingPipeline:
                 errors=[error_msg]
             )
         
-        # Extract pages from scraped data
-        pages = scraped_data.get('pages', [])
-        if not pages:
-            # Try alternative formats
-            if isinstance(scraped_data, list):
-                pages = scraped_data
+        # Extract pages from scraped data - handle multiple formats
+        pages = []
+        
+        if isinstance(scraped_data, list):
+            # Format: [{page1}, {page2}, ...] (from old orchestrator or enhanced as list)
+            pages = scraped_data
+            logger.info(f"Detected list format with {len(pages)} pages")
+            
+        elif isinstance(scraped_data, dict):
+            # Format: {"pages": [...], ...} (expected format)
+            if 'pages' in scraped_data:
+                pages = scraped_data['pages']
+                logger.info(f"Detected dict format with {len(pages)} pages")
+            elif 'scraped_pages' in scraped_data:
+                # Enhanced comprehensive format: {"scraped_pages": [...], ...}
+                pages = scraped_data['scraped_pages']
+                logger.info(f"Detected enhanced comprehensive format with {len(pages)} pages")
             else:
-                error_msg = "No pages found in scraped data"
-                logger.error(error_msg)
-                return ProcessingResult(
-                    total_pages=0,
-                    total_chunks=0,
-                    valid_chunks=0,
-                    filtered_chunks=0,
-                    duplicate_chunks=0,
-                    processing_time_seconds=0.0,
-                    output_files=[],
-                    quality_report={},
-                    errors=[error_msg]
-                )
+                # Try to treat the entire dict as a single page
+                logger.warning("Unknown dict format, treating as single page")
+                pages = [scraped_data]
+        
+        if not pages:
+            error_msg = f"No pages found in scraped data. Data type: {type(scraped_data)}, Keys: {list(scraped_data.keys()) if isinstance(scraped_data, dict) else 'N/A'}"
+            logger.error(error_msg)
+            return ProcessingResult(
+                total_pages=0,
+                total_chunks=0,
+                valid_chunks=0,
+                filtered_chunks=0,
+                duplicate_chunks=0,
+                processing_time_seconds=0.0,
+                output_files=[],
+                quality_report={},
+                errors=[error_msg]
+            )
         
         # Process the pages
         return self.process_page_data(pages, progress_callback)

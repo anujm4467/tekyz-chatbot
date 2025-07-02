@@ -94,6 +94,23 @@ class ChatbotLogger:
     def __init__(self, name: str = "tekyz_chatbot"):
         self.logger = setup_logger(name)
     
+    # Standard logging methods
+    def debug(self, message: str):
+        """Log debug message."""
+        self.logger.debug(message)
+    
+    def info(self, message: str):
+        """Log info message."""
+        self.logger.info(message)
+    
+    def warning(self, message: str):
+        """Log warning message."""
+        self.logger.warning(message)
+    
+    def error(self, message: str, exc_info: bool = False):
+        """Log error message."""
+        self.logger.error(message, exc_info=exc_info)
+    
     def log_query(self, user_query: str, session_id: str):
         """Log user query."""
         self.logger.info(f"Query received [Session: {session_id}]: {user_query[:100]}...")

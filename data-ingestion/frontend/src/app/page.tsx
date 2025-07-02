@@ -26,12 +26,29 @@ import {
   AlertCircle,
   X,
   Clock,
-  History
+  History,
+  Database,
+  RefreshCw
 } from 'lucide-react'
 import { useDropzone } from 'react-dropzone'
 
 // Configure axios defaults
 axios.defaults.baseURL = 'http://localhost:8000'
+
+interface TekyzDataStatus {
+  data_exists: boolean
+  details: {
+    exists: boolean
+    reason: string
+    vector_count: number
+    tekyz_pages: number
+    collection_info?: {
+      name: string
+      vector_size: number
+      distance: string
+    }
+  }
+}
 
 interface PipelineMetrics {
   total_urls: number
@@ -91,6 +108,11 @@ export default function PipelinePage() {
   const [loading, setLoading] = useState(false)
   const [wsConnected, setWsConnected] = useState(false)
   const [activeTab, setActiveTab] = useState<'progress' | 'history'>('progress')
+  
+  // New state for tekyz data status
+  const [tekyzDataStatus, setTekyzDataStatus] = useState<TekyzDataStatus | null>(null)
+  const [checkingTekyzData, setCheckingTekyzData] = useState(false)
+  const [scrapingTekyz, setScrapingTekyz] = useState(false)
 
   // WebSocket connection for real-time updates
   useEffect(() => {
@@ -227,6 +249,40 @@ export default function PipelinePage() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
+  // Check tekyz data status on component mount
+  useEffect(() => {
+    checkTekyzDataStatus()
+  }, [])
+
+  const checkTekyzDataStatus = async () => {
+    setCheckingTekyzData(true)
+    try {
+      const response = await axios.get('/pipeline/tekyz-data-status')
+      setTekyzDataStatus(response.data)
+    } catch (error) {
+      console.error('Failed to check tekyz data status:', error)
+    } finally {
+      setCheckingTekyzData(false)
+    }
+  }
+
+  const startTekyzScraping = async () => {
+    setScrapingTekyz(true)
+    try {
+      const response = await axios.post('/pipeline/scrape-tekyz')
+      if (response.data.success) {
+        // Pipeline will be tracked via WebSocket
+        console.log('Tekyz scraping started:', response.data.job_id)
+      } else {
+        console.error('Failed to start tekyz scraping:', response.data.error)
+      }
+    } catch (error) {
+      console.error('Error starting tekyz scraping:', error)
+    } finally {
+      setScrapingTekyz(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
       {/* Header */}
@@ -333,70 +389,165 @@ export default function PipelinePage() {
               </CardHeader>
               <CardContent className="space-y-6">
                 
-                {/* File Upload */}
-                <div className="space-y-4">
-                  <h3 className="text-lg font-medium text-white flex items-center space-x-2">
-                    <Upload className="h-5 w-5" />
-                    <span>Upload Files</span>
-                  </h3>
-                  
-                  <div
-                    {...getRootProps()}
-                    className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 ${
-                      isDragActive 
-                        ? 'border-blue-500 bg-blue-500/10' 
-                        : 'border-slate-600 hover:border-slate-500 hover:bg-slate-800/30'
-                    }`}
-                  >
-                    <input {...getInputProps()} />
-                    <Upload className="mx-auto h-12 w-12 text-slate-400 mb-4" />
-                    <div className="text-slate-300 mb-2">
-                      <span className="font-medium text-blue-400">Click to upload</span> or drag and drop
-                    </div>
-                    <p className="text-sm text-slate-500">Supports .docx, .pdf, .txt files</p>
-                  </div>
-
-                  {/* File List */}
-                  {files.length > 0 && (
-                    <div className="space-y-2">
-                      <h4 className="text-sm font-medium text-slate-300">Selected Files</h4>
-                      {files.map((file, index) => (
-                        <div key={index} className="flex items-center justify-between bg-slate-800/50 rounded-lg p-3">
-                          <div className="flex items-center space-x-3">
-                            <FileText className="h-4 w-4 text-blue-400" />
-                            <span className="text-white text-sm">{file.name}</span>
-                            <span className="text-slate-400 text-xs">({formatFileSize(file.size)})</span>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => removeFile(index)}
-                            className="text-red-400 hover:text-red-300 hover:bg-red-400/10"
-                          >
-                            <X className="h-4 w-4" />
-                          </Button>
+                {/* Tekyz Data Status Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Database className="h-5 w-5" />
+                      Tekyz.com Data Status
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    {checkingTekyzData ? (
+                      <div className="flex items-center gap-2">
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        <span>Checking database...</span>
+                      </div>
+                    ) : tekyzDataStatus ? (
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-2">
+                          {tekyzDataStatus.data_exists ? (
+                            <>
+                              <CheckCircle className="h-5 w-5 text-green-500" />
+                              <span className="text-green-700">Tekyz.com data already exists in database</span>
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="h-5 w-5 text-yellow-500" />
+                              <span className="text-yellow-700">No tekyz.com data found in database</span>
+                            </>
+                          )}
                         </div>
-                      ))}
+                        
+                        {tekyzDataStatus.details && (
+                          <div className="bg-gray-50 p-3 rounded-lg space-y-2">
+                            <p className="text-sm text-gray-600">{tekyzDataStatus.details.reason}</p>
+                            {tekyzDataStatus.details.vector_count > 0 && (
+                              <div className="grid grid-cols-2 gap-4 text-sm">
+                                <div>
+                                  <span className="font-medium">Total Vectors:</span> {tekyzDataStatus.details.vector_count}
+                                </div>
+                                <div>
+                                  <span className="font-medium">Tekyz Pages:</span> {tekyzDataStatus.details.tekyz_pages}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        
+                        <div className="flex gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={checkTekyzDataStatus}
+                            disabled={checkingTekyzData}
+                          >
+                            <RefreshCw className={`h-4 w-4 mr-2 ${checkingTekyzData ? 'animate-spin' : ''}`} />
+                            Refresh Status
+                          </Button>
+                          
+                          {!tekyzDataStatus.data_exists && (
+                            <Button
+                              onClick={startTekyzScraping}
+                              disabled={scrapingTekyz || pipelineStatus.is_running}
+                              size="sm"
+                            >
+                              <Globe className="h-4 w-4 mr-2" />
+                              {scrapingTekyz ? 'Starting...' : 'Scrape Tekyz.com'}
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-gray-500">Unable to check database status</div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* File Upload Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Upload className="h-5 w-5" />
+                      Upload Documents
+                      <Badge variant="outline">Primary Input</Badge>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div
+                      {...getRootProps()}
+                      className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 ${
+                        isDragActive 
+                          ? 'border-blue-500 bg-blue-500/10' 
+                          : 'border-slate-600 hover:border-slate-500 hover:bg-slate-800/30'
+                      }`}
+                    >
+                      <input {...getInputProps()} />
+                      <Upload className="mx-auto h-12 w-12 text-slate-400 mb-4" />
+                      <div className="text-slate-300 mb-2">
+                        <span className="font-medium text-blue-400">Click to upload</span> or drag and drop
+                      </div>
+                      <p className="text-sm text-slate-500">Supports .docx, .pdf, .txt files</p>
                     </div>
-                  )}
-                </div>
+
+                    {/* File List */}
+                    {files.length > 0 && (
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium text-slate-300">Selected Files</h4>
+                        {files.map((file, index) => (
+                          <div key={index} className="flex items-center justify-between bg-slate-800/50 rounded-lg p-3">
+                            <div className="flex items-center space-x-3">
+                              <FileText className="h-4 w-4 text-blue-400" />
+                              <span className="text-white text-sm">{file.name}</span>
+                              <span className="text-slate-400 text-xs">({formatFileSize(file.size)})</span>
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => removeFile(index)}
+                              className="text-red-400 hover:text-red-300 hover:bg-red-400/10"
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
 
                 <Separator className="bg-slate-800" />
-
-                {/* URL Input */}
-                <div className="space-y-4">
-                  <h3 className="text-lg font-medium text-white flex items-center space-x-2">
-                    <Globe className="h-5 w-5" />
-                    <span>URLs</span>
-                  </h3>
-                  <Textarea
-                    value={urls}
-                    onChange={(e) => setUrls(e.target.value)}
-                    placeholder="https://example.com&#10;https://another-site.com"
-                    className="bg-slate-800/50 border-slate-700 text-white placeholder-slate-500 focus:border-blue-500"
-                    rows={3}
-                  />
-                </div>
+                
+                {/* URL Input Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Globe className="h-5 w-5" />
+                      URLs (Optional)
+                      <Badge variant="secondary">Secondary Input</Badge>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <Alert>
+                      <AlertCircle className="h-4 w-4" />
+                      <AlertDescription>
+                        <strong>Note:</strong> If documents are uploaded, URLs will be skipped. 
+                        Documents take priority in the processing pipeline.
+                      </AlertDescription>
+                    </Alert>
+                    
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">URLs to scrape (one per line):</label>
+                      <Textarea
+                        placeholder="https://example.com/page1&#10;https://example.com/page2"
+                        value={urls}
+                        onChange={(e) => setUrls(e.target.value)}
+                        rows={4}
+                        className="font-mono text-sm"
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
 
                 {/* Action Buttons */}
                 <div className="flex space-x-4">

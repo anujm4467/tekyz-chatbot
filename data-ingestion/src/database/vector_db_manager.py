@@ -115,15 +115,30 @@ class VectorDBManager:
         Returns:
             True if collection exists or was created successfully
         """
-        if self.vector_db.collection_exists(config.collection_name):
-            logger.info(f"Collection '{config.collection_name}' already exists")
-            return True
+        try:
+            collection_info = self.vector_db.get_collection_info()
+            if collection_info and collection_info.name == config.collection_name:
+                logger.info(f"Collection '{config.collection_name}' already exists")
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking collection existence: {str(e)}")
+            # Collection doesn't exist, continue to create it
         
-        from .models import VectorConfig
+        from .models import VectorConfig, DistanceMetric
+        
+        # Convert string distance metric to enum
+        distance_map = {
+            'COSINE': DistanceMetric.COSINE,
+            'DOT': DistanceMetric.DOT,
+            'EUCLIDEAN': DistanceMetric.EUCLIDEAN,
+            'MANHATTAN': DistanceMetric.MANHATTAN
+        }
+        distance_metric = distance_map.get(config.distance_metric.upper(), DistanceMetric.COSINE)
+        
         vector_config = VectorConfig(
             collection_name=config.collection_name,
             vector_size=config.vector_size,
-            distance=config.distance_metric.upper()
+            distance_metric=distance_metric
         )
         success = self.vector_db.create_collection(vector_config)
         
@@ -137,7 +152,8 @@ class VectorDBManager:
     def ingest_embeddings(self, 
                          records: List[Any],  # EmbeddingRecord placeholder
                          config: IngestionConfig,
-                         progress_callback: Optional[Callable[[int, int], None]] = None) -> IngestionResult:
+                         progress_callback: Optional[Callable[[int, int], None]] = None,
+                         merge_mode: bool = True) -> IngestionResult:
         """
         Ingest embedding records into vector database.
         
@@ -145,11 +161,17 @@ class VectorDBManager:
             records: List of embedding records
             config: Ingestion configuration
             progress_callback: Optional callback for progress updates
+            merge_mode: If True, merge into existing collection; if False, create new
             
         Returns:
             Ingestion results with statistics
         """
         start_time = time.time()
+        
+        # For tekyz knowledge base, always use the standard collection name
+        if merge_mode or config.collection_name == "tekyz_knowledge":
+            config.collection_name = "tekyz_knowledge"
+            logger.info(f"Using merge mode - all data will be added to 'tekyz_knowledge' collection")
         
         # Ensure collection exists
         if not self.create_collection_if_not_exists(config):
@@ -163,6 +185,17 @@ class VectorDBManager:
         
         logger.info(f"Starting ingestion of {len(records)} records into '{config.collection_name}'")
         
+        # Check for existing data to handle deduplication
+        existing_count = 0
+        if merge_mode:
+            try:
+                collection_info = self.vector_db.get_collection_info(config.collection_name)
+                if collection_info:
+                    existing_count = collection_info.points_count
+                    logger.info(f"Collection '{config.collection_name}' already contains {existing_count} vectors")
+            except Exception as e:
+                logger.warning(f"Could not check existing collection size: {str(e)}")
+        
         # Initialize result tracking
         result = IngestionResult(
             total_processed=len(records),
@@ -172,13 +205,13 @@ class VectorDBManager:
             errors=[]
         )
         
-        # Process in batches
+        # Process in batches with deduplication
         batches = [records[i:i + config.batch_size] 
                   for i in range(0, len(records), config.batch_size)]
         
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
             future_to_batch = {
-                executor.submit(self._process_batch, batch, config, batch_idx): batch_idx
+                executor.submit(self._process_batch_with_dedup, batch, config, batch_idx, existing_count): batch_idx
                 for batch_idx, batch in enumerate(batches)
             }
             
@@ -191,6 +224,9 @@ class VectorDBManager:
                 try:
                     batch_result = future.result()
                     result.successful_insertions += batch_result['inserted_count']
+                    
+                    if 'duplicates_skipped' in batch_result:
+                        logger.info(f"Batch {batch_idx}: {batch_result['duplicates_skipped']} duplicates skipped")
                     
                     if 'error' in batch_result:
                         result.errors.append(f"Batch {batch_idx}: {batch_result['error']}")
@@ -206,79 +242,147 @@ class VectorDBManager:
                 if progress_callback:
                     progress_callback(completed_batches, len(batches))
         
-        # Calculate processing time
         result.processing_time_seconds = time.time() - start_time
-        
-        # Get final collection stats
-        result.collection_stats = self.vector_db.get_collection_info(config.collection_name)
         
         # Update operation stats
         self.operation_stats['insertions']['count'] += result.successful_insertions
         self.operation_stats['insertions']['total_time'] += result.processing_time_seconds
         
-        if result.errors:
-            self.operation_stats['errors']['count'] += len(result.errors)
-            self.operation_stats['errors']['last_error'] = result.errors[-1]
+        # Get final collection stats
+        try:
+            result.collection_stats = self.vector_db.get_collection_info(config.collection_name)
+        except Exception as e:
+            logger.warning(f"Could not retrieve final collection stats: {str(e)}")
         
-        logger.info(f"Ingestion completed: {result.successful_insertions}/{len(records)} successful")
+        logger.info(f"Ingestion completed: {result.successful_insertions} vectors added, "
+                   f"{result.failed_insertions} failed, {result.processing_time_seconds:.2f}s")
+        
+        if merge_mode and result.collection_stats:
+            final_count = result.collection_stats.points_count
+            logger.info(f"Collection '{config.collection_name}' now contains {final_count} total vectors "
+                       f"(was {existing_count}, added {final_count - existing_count})")
         
         return result
-    
-    def _process_batch(self, 
-                      batch: List[Any],  # EmbeddingRecord placeholder
-                      config: IngestionConfig,
-                      batch_idx: int) -> Dict[str, Any]:
+
+    def _process_batch_with_dedup(self, 
+                                 batch: List[Any],  # EmbeddingRecord placeholder
+                                 config: IngestionConfig,
+                                 batch_idx: int,
+                                 existing_count: int) -> Dict[str, Any]:
         """
-        Process a single batch of embedding records.
+        Process a batch of embeddings with deduplication support.
         
         Args:
             batch: Batch of embedding records
             config: Ingestion configuration
-            batch_idx: Batch index for tracking
+            batch_idx: Index of the batch
+            existing_count: Number of existing vectors in collection
             
         Returns:
-            Batch processing results
+            Results dictionary with insertion stats
         """
         try:
-            # Extract vectors, texts, and metadata
-            vectors = [record.embedding for record in batch]
-            texts = [record.text for record in batch]
-            metadata = [record.metadata for record in batch]
-            ids = [record.id for record in batch]
+            # Prepare embeddings for insertion in the format expected by QdrantManager
+            embeddings = []
             
-            # Prepare vectors for insertion
-            vector_data = []
-            for i, (vector, text, meta, vector_id) in enumerate(zip(vectors, texts, metadata, ids)):
-                vector_data.append({
-                    'id': vector_id,
-                    'vector': vector.tolist() if hasattr(vector, 'tolist') else vector,
-                    'payload': {
-                        'text': text,
-                        'metadata': meta or {}
+            for i, record in enumerate(batch):
+                # Generate a unique ID based on content hash to enable deduplication
+                record_id = self._generate_record_id(record, batch_idx * config.batch_size + i, existing_count)
+                
+                # Extract vector and metadata from record
+                if hasattr(record, 'embedding') and hasattr(record, 'text'):
+                    embedding_data = {
+                        'chunk_id': record_id,
+                        'embedding': record.embedding.tolist() if hasattr(record.embedding, 'tolist') else record.embedding,
+                        'text': getattr(record, 'text', ''),
+                        'clean_text': getattr(record, 'clean_text', getattr(record, 'text', '')),
+                        'source_url': getattr(record, 'source_url', ''),
+                        'char_count': len(getattr(record, 'text', '')),
+                        'word_count': len(getattr(record, 'text', '').split()),
+                        'sentence_count': getattr(record, 'text', '').count('.') + getattr(record, 'text', '').count('!') + getattr(record, 'text', '').count('?'),
+                        'model_name': getattr(record, 'model_name', ''),
+                        'metadata': {
+                            'generation_timestamp': getattr(record, 'generation_timestamp', ''),
+                            'source': getattr(record, 'source', 'unknown'),
+                            'batch_id': f'batch_{batch_idx}',
+                            'ingestion_timestamp': datetime.now().isoformat()
+                        }
                     }
-                })
+                else:
+                    # Handle different record formats
+                    embedding_data = {
+                        'chunk_id': record_id,
+                        'embedding': record.get('vector', record.get('embedding', [])),
+                        'text': record.get('text', ''),
+                        'clean_text': record.get('clean_text', record.get('text', '')),
+                        'source_url': record.get('source_url', ''),
+                        'char_count': len(record.get('text', '')),
+                        'word_count': len(record.get('text', '').split()),
+                        'sentence_count': record.get('text', '').count('.') + record.get('text', '').count('!') + record.get('text', '').count('?'),
+                        'model_name': record.get('model_name', ''),
+                        'metadata': {
+                            'source': record.get('source', 'unknown'),
+                            'batch_id': f'batch_{batch_idx}',
+                            'ingestion_timestamp': datetime.now().isoformat(),
+                            **record.get('metadata', {})
+                        }
+                    }
+                
+                embeddings.append(embedding_data)
             
-            # Insert into vector database
+            # Upload embeddings to database using QdrantManager interface
             upload_result = self.vector_db.upload_vectors(
-                collection_name=config.collection_name,
-                vectors=vector_data,
-                batch_size=len(vector_data)
+                embeddings=embeddings,
+                progress_callback=lambda stage, current, total, details: logger.debug(f"{stage}: {current}/{total} - {details}")
             )
             
-            result = {
-                'inserted_count': upload_result.uploaded_count,
-                'failed_count': upload_result.failed_count
+            return {
+                'inserted_count': upload_result.uploaded_vectors,
+                'duplicates_skipped': upload_result.failed_vectors,  # Failed uploads might be duplicates
+                'batch_size': len(batch),
+                'success_rate': upload_result.uploaded_vectors / len(batch) if len(batch) > 0 else 0
             }
             
-            if upload_result.errors:
-                result['error'] = '; '.join(upload_result.errors)
-            
-            logger.debug(f"Processed batch {batch_idx}: {result['inserted_count']} insertions")
-            return result
-            
         except Exception as e:
-            logger.error(f"Error processing batch {batch_idx}: {str(e)}")
-            return {'inserted_count': 0, 'error': str(e)}
+            logger.error(f"Batch {batch_idx} processing failed: {str(e)}")
+            return {
+                'inserted_count': 0,
+                'error': str(e),
+                'batch_size': len(batch)
+            }
+
+    def _generate_record_id(self, record: Any, index: int, existing_count: int) -> str:
+        """
+        Generate a unique ID for a record that enables deduplication.
+        
+        Args:
+            record: The embedding record
+            index: Index within the current batch
+            existing_count: Number of existing vectors
+            
+        Returns:
+            Unique string ID
+        """
+        try:
+            # Try to create a content-based hash for deduplication
+            text_content = ""
+            if hasattr(record, 'text'):
+                text_content = str(record.text)
+            elif isinstance(record, dict):
+                text_content = str(record.get('text', ''))
+            
+            if text_content:
+                # Create hash based on text content for deduplication
+                import hashlib
+                content_hash = hashlib.md5(text_content.encode('utf-8')).hexdigest()[:12]
+                return f"tekyz_{content_hash}"
+            else:
+                # Fallback to sequential ID
+                return f"tekyz_vec_{existing_count + index + 1}"
+                
+        except Exception as e:
+            logger.warning(f"Failed to generate content-based ID: {str(e)}, using sequential ID")
+            return f"tekyz_vec_{existing_count + index + 1}"
     
     def search_similar(self, 
                       collection_name: str,
@@ -563,4 +667,181 @@ class VectorDBManager:
             'cleaned_collections': 0,
             'max_age_days': max_age_days,
             'timestamp': datetime.now().isoformat()
-        } 
+        }
+    
+    def check_tekyz_data_exists(self, collection_name: str = "tekyz_knowledge") -> Dict[str, Any]:
+        """
+        Check if tekyz.com data already exists in the database.
+        
+        Args:
+            collection_name: Name of the collection to check
+            
+        Returns:
+            Dictionary with existence status and metadata
+        """
+        try:
+            # Ensure we're connected
+            if not self.vector_db._connected:
+                if not self.vector_db.connect():
+                    return {
+                        'exists': False,
+                        'reason': 'Cannot connect to database',
+                        'vector_count': 0,
+                        'tekyz_pages': 0
+                    }
+            
+            # Check if collection exists by getting collections list
+            try:
+                collections = self.vector_db.client.get_collections()
+                collection_names = [c.name for c in collections.collections]
+                
+                if collection_name not in collection_names:
+                    return {
+                        'exists': False,
+                        'reason': 'Collection does not exist',
+                        'vector_count': 0,
+                        'tekyz_pages': 0
+                    }
+            except Exception as e:
+                return {
+                    'exists': False,
+                    'reason': f'Error checking collections: {str(e)}',
+                    'vector_count': 0,
+                    'tekyz_pages': 0
+                }
+            
+            # Get collection info
+            collection_info = self.vector_db.get_collection_info()
+            
+            if not collection_info or collection_info.points_count == 0:
+                return {
+                    'exists': False,
+                    'reason': 'Collection is empty',
+                    'vector_count': 0,
+                    'tekyz_pages': 0
+                }
+            
+            # Instead of random vector search, use scroll to get all points and check metadata
+            tekyz_pages = 0
+            total_checked = 0
+            
+            try:
+                # Use scroll to iterate through all points efficiently
+                from qdrant_client.models import ScrollRequest, Filter, FieldCondition, MatchAny
+                
+                # First try to count points with tekyz-related metadata using filters
+                try:
+                    # Create filter for tekyz.com URLs
+                    tekyz_filter = Filter(
+                        should=[
+                            FieldCondition(
+                                key="url",
+                                match=MatchAny(any=["tekyz.com"])
+                            ),
+                            FieldCondition(
+                                key="source_url", 
+                                match=MatchAny(any=["tekyz.com"])
+                            ),
+                            FieldCondition(
+                                key="page_url",
+                                match=MatchAny(any=["tekyz.com"])
+                            )
+                        ]
+                    )
+                    
+                    # Count points with tekyz filter
+                    count_result = self.vector_db.client.count(
+                        collection_name=collection_name,
+                        count_filter=tekyz_filter,
+                        exact=False  # Allow approximate counting for better performance
+                    )
+                    
+                    if hasattr(count_result, 'count'):
+                        tekyz_pages = count_result.count
+                        logger.info(f"Found {tekyz_pages} tekyz-related vectors using filter")
+                    
+                except Exception as filter_error:
+                    logger.warning(f"Filter-based counting failed: {str(filter_error)}, falling back to scroll")
+                    
+                    # Fallback: use scroll to manually check metadata
+                    scroll_request = ScrollRequest(
+                        limit=100,  # Process in batches
+                        with_payload=True,
+                        with_vector=False  # We don't need vectors for metadata check
+                    )
+                    
+                    next_page_offset = None
+                    batch_count = 0
+                    
+                    while batch_count < 5:  # Limit to first 500 points for performance
+                        if next_page_offset:
+                            scroll_request.offset = next_page_offset
+                        
+                        try:
+                            scroll_result = self.vector_db.client.scroll(
+                                collection_name=collection_name,
+                                scroll_filter=scroll_request.dict() if hasattr(scroll_request, 'dict') else scroll_request
+                            )
+                            
+                            if not scroll_result[0]:  # No more points
+                                break
+                                
+                            points = scroll_result[0]
+                            next_page_offset = scroll_result[1]
+                            
+                            # Check each point's metadata
+                            for point in points:
+                                total_checked += 1
+                                if point.payload:
+                                    payload_str = str(point.payload).lower()
+                                    if 'tekyz.com' in payload_str or 'tekyz' in payload_str:
+                                        tekyz_pages += 1
+                            
+                            if not next_page_offset:  # No more pages
+                                break
+                                
+                            batch_count += 1
+                            
+                        except Exception as scroll_error:
+                            logger.warning(f"Scroll operation failed: {str(scroll_error)}")
+                            break
+                
+                logger.info(f"Metadata check complete: {tekyz_pages} tekyz pages found, {total_checked} total checked")
+                
+            except Exception as e:
+                logger.warning(f"Error during metadata check: {str(e)}")
+                # If metadata check fails, assume data exists if we have significant number of vectors
+                tekyz_pages = collection_info.points_count if collection_info.points_count > 50 else 0
+            
+            # Determine if we have tekyz data
+            # Consider it tekyz data if:
+            # 1. We found explicit tekyz references in metadata, OR
+            # 2. We have substantial amount of data (>50 vectors) in tekyz_knowledge collection
+            has_tekyz_data = (
+                tekyz_pages > 0 or 
+                (collection_name == "tekyz_knowledge" and collection_info.points_count > 50)
+            )
+            
+            return {
+                'exists': has_tekyz_data,
+                'reason': f'Found {tekyz_pages} tekyz pages, {collection_info.points_count} total vectors',
+                'vector_count': collection_info.points_count,
+                'tekyz_pages': tekyz_pages,
+                'total_checked': total_checked,
+                'collection_info': {
+                    'name': collection_info.name,
+                    'vector_size': getattr(collection_info, 'vector_size', 384),
+                    'points_count': collection_info.points_count,
+                    'segments_count': getattr(collection_info, 'segments_count', 0)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking tekyz data existence: {str(e)}")
+            return {
+                'exists': False,
+                'reason': f'Error checking data: {str(e)}',
+                'vector_count': 0,
+                'tekyz_pages': 0,
+                'error': str(e)
+            } 

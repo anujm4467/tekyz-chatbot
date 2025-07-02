@@ -82,8 +82,9 @@ class ScrapingOrchestrator:
                 logger.error("No URLs discovered for scraping")
                 return self._create_empty_result("No URLs discovered")
             
-            # Prioritize URLs
-            urls = self.url_discovery.prioritize_urls(urls)
+            # Prioritize URLs (import from config)
+            from config.urls import prioritize_urls
+            urls = prioritize_urls(urls)
             self.stats.total_urls = len(urls)
             
             logger.info(f"Found {len(urls)} URLs to scrape")

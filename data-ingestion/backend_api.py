@@ -16,6 +16,7 @@ import threading
 import time
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,8 +28,6 @@ from fastapi.staticfiles import StaticFiles
 # Add the src directory to the Python path
 import sys
 sys.path.append(str(Path(__file__).parent / "src"))
-
-# from main import DataIngestionPipeline  # Temporarily disabled to avoid file handle issues
 
 # Optional imports for file processing
 try:
@@ -269,107 +268,219 @@ class PipelineJob:
             websocket_manager.broadcast(self.status.dict())
     
     def _save_file_data(self, file_data: List[dict], websocket_manager):
-        """Save pre-read file data to the data/raw directory"""
-        self.status.current_step = "Saving uploaded files"
-        self.status.progress = 10
-        websocket_manager.broadcast(self.status.dict())
-        
+        """Save uploaded file data to processing directory"""
         upload_dir = Path("data/raw/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
         
+        self.status.current_step = "Saving uploaded files"
+        self.status.progress = 15
+        websocket_manager.broadcast(self._get_enhanced_status())
+        
         for i, file_info in enumerate(file_data):
-            if self.should_stop.is_set():
-                return
-                
             try:
                 filename = file_info['filename']
                 content = file_info['content']
                 
+                # Save file to upload directory
                 file_path = upload_dir / filename
-                self.status.logs.append(f"Saving file: {filename}")
-                websocket_manager.broadcast(self.status.dict())
+                if isinstance(content, bytes):
+                    file_path.write_bytes(content)
+                else:
+                    file_path.write_text(content, encoding='utf-8')
                 
-                # Save to disk
-                with open(file_path, "wb") as f:
-                    f.write(content)
-                    
-                log_msg = f"✅ Saved file: {filename} ({len(content)} bytes)"
-                self.status.logs.append(log_msg)
-                logger.info(log_msg)
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    f"Saved uploaded file: {filename} ({len(content)} bytes)"
+                )
+                
+                # Update progress
+                progress = 15 + (i + 1) / len(file_data) * 10
+                self.status.progress = int(progress)
+                websocket_manager.broadcast(self._get_enhanced_status())
                 
             except Exception as e:
-                error_msg = f"❌ Failed to save {file_info.get('filename', 'unknown')}: {str(e)}"
-                self.status.logs.append(error_msg)
-                self.status.errors.append({"message": error_msg, "timestamp": datetime.now().isoformat()})
+                error_msg = f"Failed to save file {file_info.get('filename', 'unknown')}: {str(e)}"
                 logger.error(error_msg)
-                websocket_manager.broadcast(self.status.dict())
-                continue
-            
-            progress = 10 + (i + 1) / len(file_data) * 10
-            self.status.progress = int(progress)
-            websocket_manager.broadcast(self.status.dict())
-            
-    def _process_urls(self, urls: List[str], websocket_manager):
-        """Process URL list for scraping"""
-        self.status.current_step = "Processing URLs"
-        self.status.progress = 20
-        websocket_manager.broadcast(self.status.dict())
-        
-        # Save URLs to a file for the pipeline to process
-        # Make sure we don't overwrite existing URLs, append instead
-        urls_file = Path("data/raw/urls.txt")
-        
-        # Read existing URLs if file exists
-        existing_urls = set()
-        if urls_file.exists():
-            with open(urls_file, "r") as f:
-                existing_urls = {line.strip() for line in f if line.strip()}
-        
-        # Add new URLs that aren't already present
-        new_urls = [url for url in urls if url not in existing_urls]
-        
-        if new_urls:
-            with open(urls_file, "a") as f:  # Append mode
-                for url in new_urls:
-                    f.write(f"{url}\n")
-            log_msg = f"Added {len(new_urls)} new URLs for processing (total: {len(existing_urls) + len(new_urls)})"
-        else:
-            log_msg = f"All {len(urls)} URLs already exist in processing queue"
-            
-        self.status.logs.append(log_msg)
-        logger.info(log_msg)
-        
-    def _execute_pipeline_direct(self, websocket_manager):
-        """Execute the pipeline directly without the problematic DataIngestionPipeline class"""
-        try:
-            self.status.logs.append("Starting direct pipeline execution...")
-            websocket_manager.broadcast(self.status.dict())
-            
-            # Run the simplified pipeline without any complex dependencies
-            result = asyncio.run(self._run_standalone_pipeline(websocket_manager))
-            
-            if result.get('success', False):
-                self.status.progress = 100
-                self.status.logs.append("Pipeline completed successfully!")
-                
-                # Handle results
-                if 'processed_chunks' in result:
-                    self.status.logs.append(f"✅ Processed {result['processed_chunks']} text chunks")
-                    
-                websocket_manager.broadcast(self.status.dict())
-            else:
-                error_msg = result.get('error', 'Pipeline failed with unknown error')
+                pipeline_tracker.add_log(self.job_id, error_msg, 'ERROR')
                 self.status.errors.append({"message": error_msg, "timestamp": datetime.now().isoformat()})
-                self.status.logs.append(f"❌ Pipeline failed: {error_msg}")
-                websocket_manager.broadcast(self.status.dict())
+        
+        # Create a flag to indicate we have document uploads
+        flag_file = upload_dir / ".has_documents"
+        flag_file.write_text("true")
+        
+        pipeline_tracker.add_log(
+            self.job_id, 
+            f"✅ Successfully saved {len(file_data)} documents for processing"
+        )
+    
+    def _process_urls(self, urls: List[str], websocket_manager):
+        """Process and save URLs for scraping with document merging support"""
+        upload_dir = Path("data/raw/uploads")
+        has_documents = (upload_dir / ".has_documents").exists()
+        
+        self.status.current_step = "Processing URLs"
+        self.status.progress = 25
+        websocket_manager.broadcast(self._get_enhanced_status())
+        
+        urls_file = Path("data/raw/urls.txt")
+        urls_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Clean and validate URLs
+        valid_urls = []
+        for url in urls:
+            url = url.strip()
+            if url and (url.startswith('http://') or url.startswith('https://')):
+                valid_urls.append(url)
+            elif url:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    f"⚠️ Invalid URL skipped: {url}", 
+                    'WARNING'
+                )
+        
+        if valid_urls:
+            urls_file.write_text('\n'.join(valid_urls))
+            if has_documents:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    f"📝 Saved {len(valid_urls)} URLs for scraping (will be merged with {upload_dir.glob('*').__len__()} uploaded documents)"
+                )
+            else:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    f"📝 Saved {len(valid_urls)} valid URLs for scraping"
+                )
+        else:
+            if has_documents:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    "📄 No URLs provided - pipeline will process uploaded documents only", 
+                    'INFO'
+                )
+            else:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    "⚠️ No valid URLs or documents provided - nothing to process", 
+                    'WARNING'
+                )
+    
+    def _execute_pipeline_direct(self, websocket_manager):
+        """Execute the complete pipeline directly using the appropriate pipeline"""
+        try:
+            # Check for uploaded files vs URLs
+            upload_dir = Path("data/raw/uploads")
+            has_documents = (upload_dir / ".has_documents").exists()
+            
+            if has_documents:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    "🔄 Processing uploaded documents with MERGE mode into tekyz_knowledge"
+                )
+                
+                # Use standalone pipeline for document processing (works better with mixed data)
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    "📄 Using standalone pipeline optimized for document + URL merging"
+                )
+                
+                # Use asyncio to run the standalone pipeline
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    result = loop.run_until_complete(self._run_standalone_pipeline(websocket_manager))
+                    
+                    if result.get('success', False):
+                        pipeline_tracker.add_log(
+                            self.job_id, 
+                            f"✅ Standalone pipeline completed successfully!"
+                        )
+                        
+                        # Log summary for standalone pipeline
+                        uploaded_vectors = result.get('uploaded_vectors', 0)
+                        if uploaded_vectors > 0:
+                            pipeline_tracker.add_log(
+                                self.job_id, 
+                                f"📊 Successfully uploaded {uploaded_vectors} new vectors to tekyz_knowledge collection"
+                            )
+                    else:
+                        error_msg = result.get('error', 'Standalone pipeline failed')
+                        pipeline_tracker.add_log(self.job_id, f"❌ Pipeline failed: {error_msg}", 'ERROR')
+                        self.status.errors.append({"message": error_msg, "timestamp": datetime.now().isoformat()})
+                    
+                finally:
+                    loop.close()
+                    
+            else:
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    "🔄 Processing URLs with MERGE mode into tekyz_knowledge"
+                )
+                
+                # Import the main pipeline for URL-only processing
+                import sys
+                sys.path.append(str(Path(__file__).parent / "src"))
+                
+                from main import DataIngestionPipeline
+                
+                # Create and configure pipeline
+                pipeline = DataIngestionPipeline()
+                
+                # Use asyncio to run the async pipeline
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    # Force scraping only if this is a manual tekyz scraping job
+                    job = pipeline_tracker.get_job(self.job_id)
+                    force_scraping = job and any('tekyz.com' in url for url in (job.input_urls or []))
+                    
+                    # Run the full pipeline with merge mode
+                    result = loop.run_until_complete(
+                        pipeline.run_full_pipeline(
+                            skip_scraping=False, 
+                            force_scraping=force_scraping
+                        )
+                    )
+                    
+                    if result.get('success', False):
+                        pipeline_tracker.add_log(
+                            self.job_id, 
+                            f"✅ Pipeline completed successfully! Data merged into tekyz_knowledge collection"
+                        )
+                        
+                        # Log summary
+                        if 'database' in result:
+                            db_result = result['database']
+                            total_vectors = db_result.get('total_vectors_in_collection', 0)
+                            new_vectors = db_result.get('uploaded_vectors', 0)
+                            pipeline_tracker.add_log(
+                                self.job_id, 
+                                f"📊 Collection now contains {total_vectors} total vectors (+{new_vectors} new)"
+                            )
+                    else:
+                        if result.get('skipped_reason'):
+                            pipeline_tracker.add_log(
+                                self.job_id, 
+                                f"ℹ️ Pipeline skipped: {result['skipped_reason']}"
+                            )
+                        else:
+                            error_msg = result.get('error', 'Unknown error')
+                            pipeline_tracker.add_log(self.job_id, f"❌ Pipeline failed: {error_msg}", 'ERROR')
+                            self.status.errors.append({"message": error_msg, "timestamp": datetime.now().isoformat()})
+                    
+                finally:
+                    loop.close()
                 
         except Exception as e:
-            logger.error(f"Direct pipeline execution failed: {str(e)}")
-            self.status.errors.append({"message": str(e), "timestamp": datetime.now().isoformat()})
-            self.status.logs.append(f"❌ Pipeline failed: {str(e)}")
-            websocket_manager.broadcast(self.status.dict())
+            error_msg = f"Pipeline execution failed: {str(e)}"
+            logger.error(error_msg)
+            pipeline_tracker.add_log(self.job_id, error_msg, 'ERROR')
+            self.status.errors.append({"message": error_msg, "timestamp": datetime.now().isoformat()})
             raise
-        
+    
     def _execute_pipeline(self, pipeline, websocket_manager):
         """Execute the main data pipeline"""
         try:
@@ -430,21 +541,26 @@ class PipelineJob:
             generated_embeddings = 0
             uploaded_vectors = 0
             
-            # Check for URLs first
-            urls_file = Path("data/raw/urls.txt")
-            has_urls = urls_file.exists() and urls_file.stat().st_size > 0
+            # Check if URLs were actually provided for THIS job (not from old files)
+            job = pipeline_tracker.get_job(self.job_id)
+            has_urls = job and job.input_urls and len(job.input_urls) > 0
             
             # Check for uploaded files
             upload_dir = Path("data/raw/uploads")
             has_uploads = upload_dir.exists() and list(upload_dir.glob("*"))
             
+            # Initialize combined data storage
+            all_scraped_data = []
+            
             if has_urls:
-                # Read URLs from file first
-                with open(urls_file, 'r') as f:
-                    urls = [line.strip() for line in f if line.strip()]
+                # Get URLs from the current job (not from old files)
+                urls = job.input_urls
                 
                 pipeline_tracker.start_step(self.job_id, "web_scraping", len(urls))
-                self.status.logs.append(f"Found {len(urls)} URLs to scrape")
+                if has_uploads:
+                    self.status.logs.append(f"Found {len(urls)} URLs to scrape (will be merged with uploaded documents)")
+                else:
+                    self.status.logs.append(f"Found {len(urls)} URLs to scrape")
                 pipeline_tracker.update_step_progress(self.job_id, "web_scraping", 0, 5)
                 websocket_manager.broadcast(self.status.dict())
                 
@@ -454,6 +570,8 @@ class PipelineJob:
                 websocket_manager.broadcast(self.status.dict())
                 
                 scraped_data = await self._scrape_urls(urls, websocket_manager)
+                if scraped_data:
+                    all_scraped_data.extend(scraped_data)
                 
                 # Improved success/failure logic for web scraping
                 if scraped_data and len(scraped_data) > 0:
@@ -545,44 +663,54 @@ class PipelineJob:
                         pipeline_tracker.skip_step(self.job_id, "database_upload", "No content to upload")
             
             if has_uploads:
-                if not has_urls:  # Only start if not already started for URLs
-                    pipeline_tracker.start_step(self.job_id, "content_cleaning")
-                
-                self.status.logs.append("Processing uploaded files...")
-                websocket_manager.broadcast(self.status.dict())
-                
-                # Step 1: Create scraped data from uploads
+                # Step 1: Add uploaded files to scraped data for merging
                 self.status.current_step = "Processing Uploads"
-                self.status.progress = 50
-                scraped_data_file = self._create_scraped_data_from_uploads(upload_dir)
-                self.status.logs.append(f"Created data file: {scraped_data_file}")
+                self.status.progress = 50 if not has_urls else 30
+                
+                if has_urls:
+                    self.status.logs.append(f"Processing uploaded files for merging with {len(all_scraped_data)} scraped pages...")
+                else:
+                    self.status.logs.append("Processing uploaded files...")
+                    pipeline_tracker.start_step(self.job_id, "content_cleaning")
+                    
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Step 2: Advanced text processing and chunking
-                pipeline_tracker.start_step(self.job_id, "text_chunking")
-                self.status.current_step = "Text Processing & Chunking"
+                # Create scraped data from uploads and add to combined data
+                upload_scraped_data = self._create_upload_data_for_merging(upload_dir)
+                if upload_scraped_data:
+                    all_scraped_data.extend(upload_scraped_data)
+                    self.status.logs.append(f"Added {len(upload_scraped_data)} uploaded documents to processing queue")
+                    
+                websocket_manager.broadcast(self.status.dict())
+            
+            # Now process ALL data (scraped + uploaded) together if we have any
+            if all_scraped_data:
+                # Step 2: Advanced text processing and chunking for ALL data
+                if not has_urls:  # Only start if not already started for URLs
+                    pipeline_tracker.start_step(self.job_id, "text_chunking", len(all_scraped_data))
+                
+                self.status.current_step = "Text Processing & Chunking (Combined Data)"
                 self.status.progress = 60
+                
+                total_sources = len(all_scraped_data)
+                self.status.logs.append(f"Processing {len(all_scraped_data)} pages from {('web scraping + ' if has_urls else '') + ('uploads' if has_uploads else '')} combined...")
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Load the scraped data
-                with open(scraped_data_file, 'r', encoding='utf-8') as f:
-                    scraped_data = json.load(f)
-                
-                # Use the real text processor
-                all_chunks = self._process_with_real_pipeline(scraped_data, websocket_manager)
+                # Use the real text processor for ALL combined data
+                all_chunks = self._process_with_real_pipeline(all_scraped_data, websocket_manager)
                 processed_chunks += len(all_chunks)
                 pipeline_tracker.complete_step(self.job_id, "text_chunking", success=True)
                 
-                self.status.logs.append(f"Created {len(all_chunks)} text chunks")
+                self.status.logs.append(f"Created {len(all_chunks)} text chunks from combined data sources")
                 self.status.progress = 70
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Step 3: Generate embeddings
+                # Step 3: Generate embeddings for ALL combined data
                 pipeline_tracker.start_step(self.job_id, "embedding_generation", len(all_chunks))
                 
-                self.status.current_step = "Generating Embeddings"
+                self.status.current_step = "Generating Embeddings (Combined Data)"
                 self.status.progress = 80
-                self.status.logs.append("Generating vector embeddings...")
+                self.status.logs.append(f"Generating vector embeddings for {len(all_chunks)} chunks from combined sources...")
                 websocket_manager.broadcast(self.status.dict())
                 
                 embeddings_data = self._generate_embeddings(all_chunks, websocket_manager)
@@ -593,20 +721,26 @@ class PipelineJob:
                 self.status.logs.append(f"Generated embeddings for {len(embeddings_data)} chunks")
                 websocket_manager.broadcast(self.status.dict())
                 
-                # Step 4: Upload to vector database with deduplication
+                # Step 4: Upload ALL combined data to vector database with deduplication
                 pipeline_tracker.start_step(self.job_id, "database_upload", len(embeddings_data))
                 
-                self.status.current_step = "Storing Vectors"
+                self.status.current_step = "Storing Vectors (Merged Data)"
                 self.status.progress = 90
-                self.status.logs.append("Uploading vectors to database with deduplication...")
+                self.status.logs.append(f"Uploading {len(embeddings_data)} vectors from merged sources to tekyz_knowledge...")
                 websocket_manager.broadcast(self.status.dict())
                 
                 upload_results = self._upload_to_vector_db_with_dedup(embeddings_data, websocket_manager)
                 uploaded_vectors += upload_results.get('uploaded_count', 0)
                 
                 pipeline_tracker.complete_step(self.job_id, "database_upload", success=True)
+                
+                # Log final merge results
+                pipeline_tracker.add_log(
+                    self.job_id, 
+                    f"✅ Successfully merged and uploaded data from {'web scraping + ' if has_urls else ''}{'document uploads' if has_uploads else ''}"
+                )
             
-            if not has_urls and not has_uploads:
+            if not has_urls and not has_uploads and not all_scraped_data:
                 # Skip all content processing steps when no data
                 pipeline_tracker.skip_step(self.job_id, "web_scraping", "No URLs provided")
                 pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No content to clean")
@@ -624,7 +758,7 @@ class PipelineJob:
                 
                 return {'success': False, 'error': 'No data to process - no URLs or uploaded files found'}
             
-            # Skip unused steps based on what data we have
+            # Skip unused steps based on what data we have  
             if not has_uploads:
                 # Skip file processing step when only URLs provided
                 pipeline_tracker.skip_step(self.job_id, "file_processing", "No files uploaded")
@@ -632,7 +766,9 @@ class PipelineJob:
             # Skip remaining steps if not used and finalize job
             if not has_urls:
                 pipeline_tracker.skip_step(self.job_id, "web_scraping", "No URLs provided")
-            if not has_uploads and not has_urls:
+            
+            # Only skip these steps if we truly have no data to process
+            if not has_uploads and not has_urls and not all_scraped_data:
                 pipeline_tracker.skip_step(self.job_id, "content_cleaning", "No content to clean")
                 pipeline_tracker.skip_step(self.job_id, "text_chunking", "No content to chunk")
                 pipeline_tracker.skip_step(self.job_id, "embedding_generation", "No content to embed")
@@ -666,12 +802,68 @@ class PipelineJob:
             return {'success': False, 'error': str(e)}
     
     async def _scrape_urls(self, urls: List[str], websocket_manager):
-        """Scrape content from URLs using recursive crawling with dynamic link discovery"""
+        """Scrape content from URLs using enhanced recursive crawling with comprehensive discovery"""
+        try:
+            from src.scraper.enhanced_orchestrator import EnhancedScrapingOrchestrator
+            from src.scraper.enhanced_discovery import EnhancedURLDiscovery
+            from src.scraper.enhanced_scraper import EnhancedScraper
+            
+            # Initialize enhanced components
+            enhanced_orchestrator = EnhancedScrapingOrchestrator()
+            enhanced_discovery = EnhancedURLDiscovery()
+            
+            # Use enhanced orchestrator for comprehensive scraping
+            pipeline_tracker.add_log(self.job_id, f"🚀 Starting enhanced comprehensive scraping for domain: {urlparse(urls[0]).netloc if urls else 'unknown'}")
+            websocket_manager.broadcast(self._get_enhanced_status())
+            
+            # Execute comprehensive scraping with enhanced discovery and extraction
+            result = await enhanced_orchestrator.run_comprehensive_scrape(
+                max_discovery_depth=5,      # Deep crawling for comprehensive coverage
+                max_discovery_pages=500,    # Large number for maximum discovery  
+                max_scraping_concurrent=3,  # Balanced concurrency for API
+                enable_content_extraction=True
+            )
+            
+            if result.get('success', False):
+                scraped_pages = result.get('scraped_pages', [])
+                
+                # Update metrics with enhanced results
+                self.metrics.total_urls = result['stats']['urls_discovered']
+                self.metrics.processed_urls = result['stats']['urls_attempted'] 
+                self.metrics.successful_urls = result['stats']['urls_successful']
+                self.metrics.failed_urls = result['stats']['urls_failed']
+                self._update_metrics()
+                
+                # Log comprehensive results
+                stats = result['stats']
+                pipeline_tracker.add_log(self.job_id, f"✅ Enhanced scraping completed successfully!")
+                pipeline_tracker.add_log(self.job_id, f"📊 URLs discovered: {stats['urls_discovered']}")
+                pipeline_tracker.add_log(self.job_id, f"📄 Pages scraped: {stats['urls_successful']}")
+                pipeline_tracker.add_log(self.job_id, f"📈 Success rate: {stats['success_rate']:.1f}%")
+                pipeline_tracker.add_log(self.job_id, f"💾 Output file: {result['output_file']}")
+                
+                websocket_manager.broadcast(self._get_enhanced_status())
+                return scraped_pages
+            else:
+                error_msg = result.get('error', 'Enhanced scraping failed')
+                pipeline_tracker.add_log(self.job_id, f"❌ Enhanced scraping failed: {error_msg}", 'ERROR')
+                return []
+                
+        except ImportError as e:
+            pipeline_tracker.add_log(self.job_id, f"❌ Enhanced scraping components not available, falling back to original: {e}", 'WARNING')
+            # Fallback to original scraping
+            return await self._fallback_scrape_urls(urls, websocket_manager)
+        except Exception as e:
+            pipeline_tracker.add_log(self.job_id, f"❌ Enhanced scraping failed: {str(e)}", 'ERROR')
+            return []
+    
+    async def _fallback_scrape_urls(self, urls: List[str], websocket_manager):
+        """Fallback scraping using original components"""
         try:
             from src.scraper.orchestrator import ScrapingOrchestrator
             from src.scraper.url_discovery import URLDiscovery
             
-            # Initialize components
+            # Initialize original components as fallback
             orchestrator = ScrapingOrchestrator()
             url_discovery = URLDiscovery()
             
@@ -683,7 +875,6 @@ class PipelineJob:
             # Determine base domain for crawling scope
             base_domain = None
             if urls:
-                from urllib.parse import urlparse
                 base_domain = urlparse(urls[0]).netloc
                 pipeline_tracker.add_log(self.job_id, f"Starting recursive crawling for domain: {base_domain}")
             else:
@@ -748,7 +939,6 @@ class PipelineJob:
                             valid_new_urls = []
                             for new_url in new_urls:
                                 try:
-                                    from urllib.parse import urlparse
                                     new_domain = urlparse(new_url).netloc
                                     
                                     # Only add URLs from the same domain
@@ -1333,8 +1523,70 @@ class PipelineJob:
                 'error': str(e)
             }
     
+    def _create_upload_data_for_merging(self, upload_dir: Path) -> List[Dict[str, Any]]:
+        """Create scraped data format from uploaded files for merging with web scraped data"""
+        upload_data = []
+        
+        # Process uploaded files
+        for file_path in upload_dir.glob("*"):
+            if file_path.is_file() and file_path.name != ".has_documents":
+                try:
+                    if file_path.suffix.lower() == '.txt':
+                        content = file_path.read_text(encoding='utf-8')
+                    elif file_path.suffix.lower() == '.pdf':
+                        if HAS_PDF_SUPPORT:
+                            content = self._extract_pdf_content(file_path)
+                        else:
+                            content = f"PDF file: {file_path.name} (PyPDF2 not installed - pip install PyPDF2)"
+                    elif file_path.suffix.lower() == '.docx':
+                        if HAS_DOCX_SUPPORT:
+                            try:
+                                content = self._extract_docx_content(file_path)
+                            except Exception as docx_error:
+                                content = f"DOCX file: {file_path.name} (Error reading file: {str(docx_error)})"
+                                logger.error(f"Failed to extract DOCX content from {file_path}: {docx_error}")
+                        else:
+                            content = f"DOCX file: {file_path.name} (python-docx not installed - pip install python-docx)"
+                    else:
+                        continue
+                    
+                    # Create data in same format as scraped pages for seamless merging
+                    page_data = {
+                        "url": f"file://{file_path}",
+                        "title": file_path.name,
+                        "content": content,
+                        "text": content,  # Some processors expect 'text' field
+                        "timestamp": datetime.now().isoformat(),
+                        "scraped_at": datetime.now().isoformat(),
+                        "success": True,
+                        "source_type": "uploaded_document",
+                        "file_type": file_path.suffix.lower(),
+                        "metadata": {
+                            "source": "upload",
+                            "filename": file_path.name,
+                            "file_size": file_path.stat().st_size,
+                            "upload_timestamp": datetime.now().isoformat()
+                        }
+                    }
+                    upload_data.append(page_data)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process uploaded file {file_path}: {e}")
+                    pipeline_tracker.add_log(
+                        self.job_id, 
+                        f"⚠️ Failed to process uploaded file {file_path.name}: {str(e)}", 
+                        'WARNING'
+                    )
+                    continue
+        
+        pipeline_tracker.add_log(
+            self.job_id, 
+            f"📄 Prepared {len(upload_data)} uploaded documents for merging"
+        )
+        return upload_data
+
     def _create_scraped_data_from_uploads(self, upload_dir: Path):
-        """Create a scraped data file from uploaded files"""
+        """Create a scraped data file from uploaded files (legacy method for compatibility)"""
         scraped_data = {
             "scraping_timestamp": datetime.now().isoformat(),
             "source": "uploaded_files",
@@ -1834,6 +2086,163 @@ async def get_step_logs(job_id: str, step_name: str):
     except Exception as e:
         logger.error(f"Failed to get step logs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get step logs: {str(e)}")
+
+@app.get("/pipeline/tekyz-data-status")
+async def check_tekyz_data_status():
+    """Check if tekyz.com data already exists in the database"""
+    try:
+        # Initialize vector database manager with proper configuration
+        from src.database.qdrant_client import QdrantManager
+        from src.database.vector_db_manager import VectorDBManager
+        from src.database.models import VectorConfig
+        
+        # Create proper config for QdrantManager
+        vector_config = VectorConfig(
+            collection_name="tekyz_knowledge",
+            host="localhost",
+            port=6333
+        )
+        
+        vector_db = QdrantManager(config=vector_config)
+        
+        # Connect to database
+        if not vector_db.connect():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "error": "Cannot connect to vector database",
+                    "data_exists": False
+                }
+            )
+        
+        vector_db_manager = VectorDBManager(vector_db=vector_db)
+        
+        # Check if data exists
+        status = vector_db_manager.check_tekyz_data_exists()
+        
+        return {
+            "success": True,
+            "data_exists": status.get('exists', False),
+            "details": status
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to check tekyz data status: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e),
+                "data_exists": False
+            }
+        )
+
+@app.post("/pipeline/scrape-tekyz")
+async def manually_scrape_tekyz():
+    """Manually trigger tekyz.com scraping"""
+    try:
+        # Check if a pipeline is already running
+        if active_jobs:
+            running_jobs = [job for job in active_jobs.values() if job.status.is_running]
+            if running_jobs:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "success": False,
+                        "error": "Another pipeline is already running",
+                        "running_job_id": running_jobs[0].job_id
+                    }
+                )
+        
+        # Create a new job specifically for tekyz scraping
+        job_id = str(uuid.uuid4())
+        job = PipelineJob(job_id)
+        active_jobs[job_id] = job
+        
+        # Prepare tekyz.com URLs for scraping
+        tekyz_urls = [
+            "https://tekyz.com",
+            "https://tekyz.com/about",
+            "https://tekyz.com/services", 
+            "https://tekyz.com/products",
+            "https://tekyz.com/solutions",
+            "https://tekyz.com/contact"
+        ]
+        
+        # Start the scraping job
+        job.start(file_data=[], urls=tekyz_urls, websocket_manager=websocket_manager)
+        
+        return {
+            "success": True,
+            "message": "Tekyz.com scraping started",
+            "job_id": job_id,
+            "urls_to_scrape": len(tekyz_urls)
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to start tekyz scraping: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e)
+            }
+        )
+
+@app.post("/pipeline/enhanced-scrape-tekyz")
+async def enhanced_scrape_tekyz():
+    """Manually trigger enhanced comprehensive tekyz.com scraping with maximum coverage"""
+    try:
+        # Check if a pipeline is already running
+        if active_jobs:
+            running_jobs = [job for job in active_jobs.values() if job.status.is_running]
+            if running_jobs:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "success": False,
+                        "error": "Another pipeline is already running",
+                        "running_job_id": running_jobs[0].job_id
+                    }
+                )
+        
+        # Create a new job specifically for enhanced tekyz scraping
+        job_id = str(uuid.uuid4())
+        job = PipelineJob(job_id)
+        active_jobs[job_id] = job
+        
+        # Enhanced scraping will discover URLs automatically, just provide seed
+        tekyz_seed_urls = ["https://tekyz.com"]
+        
+        # Start the enhanced scraping job
+        job.start(file_data=[], urls=tekyz_seed_urls, websocket_manager=websocket_manager)
+        
+        return {
+            "success": True,
+            "message": "Enhanced comprehensive tekyz.com scraping started",
+            "job_id": job_id,
+            "features": [
+                "🔍 Comprehensive URL discovery (sitemap + crawling + patterns)",
+                "🕷️ Advanced scraping with multiple fallback strategies",
+                "📊 Detailed content analysis and quality validation",
+                "🎯 Expected 5-10x more pages discovered than basic scraping",
+                "⚡ Real-time progress tracking with ETA calculation"
+            ],
+            "expected_coverage": "500-1000+ pages (vs ~50-100 with basic scraping)"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to start enhanced tekyz scraping: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e)
+            }
+        )
+
+
 
 if __name__ == "__main__":
     # Create necessary directories

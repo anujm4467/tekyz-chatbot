@@ -217,11 +217,11 @@ async def chat_endpoint(request: ChatRequest):
         # Log analytics
         if analytics:
             try:
-                analytics.log_query(
-                    query=request.query,
-                    response=response_data.content,
-                    confidence=response_data.confidence,
-                    session_id=request.session_id or "unknown"
+                analytics.log_query_interaction(
+                    session_id=request.session_id or "unknown",
+                    user_query=request.query,
+                    chat_response=response_data,
+                    classification_result=classification
                 )
             except Exception as e:
                 logger.warning(f"Analytics logging failed: {e}")
@@ -233,7 +233,7 @@ async def chat_endpoint(request: ChatRequest):
         if hasattr(search_results, 'results'):
             sources = [result.source_url for result in search_results.results if hasattr(result, 'source_url')]
         elif isinstance(search_results, list):
-            sources = [result.get('source_url', '') for result in search_results if result.get('source_url')]
+            sources = [result.source_url for result in search_results if hasattr(result, 'source_url') and result.source_url]
         
         logger.info(f"Query processed successfully in {processing_time:.2f}s")
         
